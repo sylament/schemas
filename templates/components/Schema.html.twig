@@ -1,0 +1,5 @@
+<div {{ stimulus_controller('sylament/schemas/test') }} class="sy-schema grid gap-2">
+    {% for component in component.getComponents %}
+        {{ renderComponent(component) }}
+    {% endfor %}
+</div>
