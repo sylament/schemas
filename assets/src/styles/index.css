@@ -1,3 +1,2 @@
-@import './components/grid.css' layer(components);
-@import './components/group.css' layer(components);
-@import './components/schema.css' layer(components);
+/* Aggregator for this package's component styles, e.g.:
+   @import './components/schema.css' layer(components); */
