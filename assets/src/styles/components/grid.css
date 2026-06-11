@@ -1,0 +1,6 @@
+.sy-sc-grid {
+    @apply grid gap-6;
+    /* Column count is a per-instance value, set as an inline CSS variable by the
+       template — never as a dynamic class name. */
+    grid-template-columns: repeat(var(--sy-grid-cols, 1), minmax(0, 1fr));
+}

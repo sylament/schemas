@@ -1,3 +1,3 @@
-<div style="color: {{ component.getColor }}">
+<div class="sy sy-sc-text"{% if component.getColor is not null %} style="--sy-text-color: {{ component.getColor }}"{% endif %}>
     {{ component.getState }}
 </div>

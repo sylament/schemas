@@ -1,1 +1,4 @@
-@source "../../../templates";
+@import './components/grid.css' layer(components);
+@import './components/group.css' layer(components);
+@import './components/schema.css' layer(components);
+@import './components/text.css' layer(components);
