@@ -19,11 +19,6 @@ class SylamentSchemasBundle extends SylamentBundle
         $this->configureServices($configurator);
     }
 
-    public function prependExtension(ContainerConfigurator $configurator, ContainerBuilder $container): void
-    {
-        $this->prependAssetMapper($container);
-    }
-
     private function configureServices(ContainerConfigurator $configurator): void
     {
         $services = $configurator->services();
@@ -31,20 +26,5 @@ class SylamentSchemasBundle extends SylamentBundle
         $services
             ->set(SchemasExtension::class)
             ->tag('twig.extension');
-    }
-
-    private function prependAssetMapper(ContainerBuilder $container): void
-    {
-        if (!$this->isAssetMapperAvailable($container)) {
-            return;
-        }
-
-        $container->prependExtensionConfig('framework', [
-            'asset_mapper' => [
-                'paths' => [
-                    __DIR__ . '/../assets/dist' => '@sylament/schemas',
-                ],
-            ],
-        ]);
     }
 }
