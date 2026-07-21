@@ -287,3 +287,98 @@ it('places the content class on the child schema root', function (): void {
     expect($html)->not->toContain('<div class="sy-section-content">')
         ->toMatch('/class="sy sy-sc[^"]*sy-section-content"/');
 });
+
+it('renders the after-header slot as an inline end-aligned schema in the header', function (): void {
+    $html = renderSection(Section::make('Heading')->afterHeader([new Component()]));
+
+    expect($html)->toMatch('/sy-section-header-after-ctn">\s*<div\s+class="sy sy-sc sy-inline[^"]*sy-align-end/');
+});
+
+it('renders the header for an after-header slot alone', function (): void {
+    $html = renderSection(Section::make()->afterHeader([new Component()]));
+
+    expect($html)->toContain('sy-section-header');
+});
+
+it('renders no slot containers or inline schemas without slots', function (): void {
+    $html = renderSection(Section::make('Heading')->components([new Component()]));
+
+    expect($html)->not->toContain('sy-section-header-after-ctn')
+        ->not->toContain('sy-section-footer')
+        ->not->toContain('sy-inline');
+});
+
+it('renders the footer slot as an unaligned inline schema in the content container', function (): void {
+    $html = renderSection(Section::make('Heading')->footer([new Component()]));
+
+    expect($html)->toMatch('/<footer class="sy-section-footer">\s*<div\s+class="sy sy-sc sy-inline/')
+        ->not->toContain('sy-align-');
+});
+
+it('renders the label slots around the label', function (): void {
+    $html = renderSection(
+        Section::make('Heading')
+            ->label('My label')
+            ->beforeLabel(Schema::make()->extraAttributes(['data-slot' => 'before-label']))
+            ->afterLabel(Schema::make()->extraAttributes(['data-slot' => 'after-label'])),
+    );
+
+    expect($html)->toMatch(
+        '/sy-sc-section-label-ctn.*?data-slot="before-label".*?class="sy-sc-section-label".*?data-slot="after-label"/s',
+    );
+});
+
+it('does not render label slots without a label', function (): void {
+    $html = renderSection(
+        Section::make('Heading')->beforeLabel(Schema::make()->extraAttributes(['data-slot' => 'before-label'])),
+    );
+
+    expect($html)->not->toContain('sy-sc-section-label-ctn')
+        ->not->toContain('data-slot="before-label"');
+});
+
+it('renders the above and below content slots around the section element', function (): void {
+    $html = renderSection(
+        Section::make('Heading')
+            ->aboveContent(Schema::make()->extraAttributes(['data-slot' => 'above-content']))
+            ->belowContent(Schema::make()->extraAttributes(['data-slot' => 'below-content'])),
+    );
+
+    expect($html)->toMatch('/data-slot="above-content".*?<section.*?<\/section>.*?data-slot="below-content"/s');
+});
+
+it('cascades heading tags down nested sections', function (): void {
+    $html = renderSection(
+        Section::make('Outer')->components([
+            Section::make('Inner'),
+        ]),
+    );
+
+    expect($html)->toMatch('~<h2\s[^>]*id="outer::section-heading"~')
+        ->toMatch('~<h3\s[^>]*id="inner::section-heading"~');
+});
+
+it('does not bump the heading level under a heading-less section', function (): void {
+    $html = renderSection(
+        Section::make()->components([
+            Section::make('Inner'),
+        ]),
+    );
+
+    expect($html)->toMatch('~<h2\s[^>]*id="inner::section-heading"~');
+});
+
+it('renders headings beyond h6 as paragraphs, honoring the schema root heading level', function (): void {
+    $html = renderToHtml(
+        Schema::make(new HasSchemasFixture())
+            ->rootHeadingLevel(6)
+            ->components([
+                Section::make('Outer')->components([
+                    Section::make('Inner'),
+                ]),
+            ]),
+    );
+
+    expect($html)->toMatch('~<h6\s[^>]*id="outer::section-heading"~')
+        ->toMatch('~<p\s[^>]*id="inner::section-heading"~');
+});
