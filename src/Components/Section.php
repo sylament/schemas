@@ -14,6 +14,7 @@ use Sylament\Schemas\Components\Concerns\HasDescription;
 use Sylament\Schemas\Components\Concerns\HasHeading;
 use Sylament\Schemas\Components\Concerns\HasLabel;
 use Sylament\Support\Component\Concerns\CanBeContained;
+use Symfony\Component\String\Slugger\AsciiSlugger;
 use Twig\Markup;
 
 class Section extends Component
@@ -30,23 +31,62 @@ class Section extends Component
 
     protected string|Closure|null $template = '@SylamentSchemas/components/Section.html.twig';
 
-    /**
-     * @param string|Markup|callable():(string|Markup)|null $heading
-     */
-    final public function __construct(string|Markup|callable|null $heading = null)
+    final public function __construct(string|Markup|Closure|null $heading = null)
     {
         $this->heading($heading);
     }
 
-    /**
-     * @param string|Markup|callable():(string|Markup)|null $heading
-     */
-    public static function make(string|Markup|callable|null $heading = null): static
+    public static function make(string|Markup|Closure|null $heading = null): static
     {
         $section = new static($heading);
 
         $section->configure();
 
         return $section;
+    }
+
+    protected function setUp(): void
+    {
+        parent::setUp();
+
+        $this->key(function (Section $component): ?string {
+            $heading = $component->getHeading();
+
+            if ($heading === null || mb_trim((string) $heading) === '') {
+                return null;
+            }
+
+            return new AsciiSlugger()->slug((string) $heading)->lower()->toString() . '::section';
+        }, isInheritable: false);
+    }
+
+    /**
+     * @return array<string, mixed>
+     */
+    public function getExtraTemplateData(): array
+    {
+        $id = $this->getId();
+        if ($id === '') {
+            $id = null;
+        }
+
+        $hasHeading = mb_trim((string) $this->getHeading()) !== '';
+        $hasDescription = mb_trim((string) $this->getDescription()) !== '';
+        $hasLabel = mb_trim((string) $this->getLabel()) !== '';
+
+        $labelId = $id !== null && $hasLabel && !$hasHeading ? "{$id}-label" : null;
+        $headingId = $id !== null && $hasHeading ? "{$id}-heading" : null;
+        $descriptionId = $id !== null && $hasDescription ? "{$id}-description" : null;
+        $contentId = $id !== null ? "{$id}-content" : null;
+
+        return [
+            'id' => $id,
+            'labelId' => $labelId,
+            'labelledById' => $headingId ?? $labelId,
+            'headingId' => $headingId,
+            'descriptionId' => $descriptionId,
+            'contentId' => $contentId,
+            'childSchema' => $this->getChildSchema()?->extraAttributes(['class' => 'sy-section-content']),
+        ];
     }
 }
