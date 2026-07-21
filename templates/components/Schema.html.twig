@@ -1,10 +1,10 @@
 <div
         {{ html_attr({
-            class: html_classes({
-                'sy': true,
-                'sy-sc': true
-            })
-        }) }}
+            class: html_classes('sy sy-sc', {
+                'sy-sc-has-gap': component.hasGap,
+                'sy-sc-dense': component.isDense,
+            })|split(' '),
+        }, grid(component.getColumns)) }}
 >
     {% for childComponent in component.getComponents %}
         {{ renderComponent(childComponent) }}
