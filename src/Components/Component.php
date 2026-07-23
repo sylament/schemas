@@ -5,7 +5,10 @@ declare(strict_types=1);
 namespace Sylament\Schemas\Components;
 
 use Sylament\Schemas\Components\Concerns\BelongsToContainer;
+use Sylament\Schemas\Components\Concerns\CanBeHidden;
 use Sylament\Schemas\Components\Concerns\HasChildComponents;
+use Sylament\Schemas\Components\Concerns\HasState;
+use Sylament\Schemas\Components\Concerns\HasStateBindingModifiers;
 use Sylament\Schemas\Concerns\HasColumns;
 use Sylament\Schemas\Concerns\HasGap;
 use Sylament\Schemas\Components\Concerns\HasHeadings;
@@ -16,10 +19,12 @@ use Sylament\Support\Component\Concerns\CanOrderColumns;
 use Sylament\Support\Component\Concerns\CanSpanColumns;
 use Sylament\Support\Component\Concerns\HasExtraAttributes;
 use Sylament\Support\Component\ViewComponent;
+use Sylament\Support\Data\ClosureParameter;
 
 class Component extends ViewComponent
 {
     use BelongsToContainer;
+    use CanBeHidden;
     use CanGrow;
     use CanOrderColumns;
     use CanSpanColumns;
@@ -30,6 +35,20 @@ class Component extends ViewComponent
     use HasHeadings;
     use HasId;
     use HasKey;
+    use HasState;
+    use HasStateBindingModifiers;
 
     protected string $evaluationIdentifier = 'component';
+
+    protected function resolveDefaultClosureDependencyForEvaluationByName(string $parameterName): ?ClosureParameter
+    {
+        return match ($parameterName) {
+            'get' => ClosureParameter::make($this->makeGetUtility()),
+            'set' => ClosureParameter::make($this->makeSetUtility()),
+            'state' => ClosureParameter::make($this->getState()),
+            'rawState' => ClosureParameter::make($this->getRawState()),
+            'liveComponent' => ClosureParameter::make($this->getLiveComponent()),
+            default => parent::resolveDefaultClosureDependencyForEvaluationByName($parameterName),
+        };
+    }
 }
