@@ -6,6 +6,7 @@ namespace Sylament\Schemas\Components;
 
 use Sylament\Schemas\Components\Concerns\BelongsToContainer;
 use Sylament\Schemas\Components\Concerns\CanBeHidden;
+use Sylament\Schemas\Components\Concerns\HasActions;
 use Sylament\Schemas\Components\Concerns\HasChildComponents;
 use Sylament\Schemas\Components\Concerns\HasState;
 use Sylament\Schemas\Components\Concerns\HasStateBindingModifiers;
@@ -14,12 +15,12 @@ use Sylament\Schemas\Concerns\HasGap;
 use Sylament\Schemas\Components\Concerns\HasHeadings;
 use Sylament\Schemas\Components\Concerns\HasId;
 use Sylament\Schemas\Components\Concerns\HasKey;
-use Sylament\Support\Component\Concerns\CanGrow;
-use Sylament\Support\Component\Concerns\CanOrderColumns;
-use Sylament\Support\Component\Concerns\CanSpanColumns;
-use Sylament\Support\Component\Concerns\HasExtraAttributes;
-use Sylament\Support\Component\ViewComponent;
-use Sylament\Support\Data\ClosureParameter;
+use Sylament\Support\Components\Concerns\CanGrow;
+use Sylament\Support\Components\Concerns\CanOrderColumns;
+use Sylament\Support\Components\Concerns\CanSpanColumns;
+use Sylament\Support\Components\Concerns\HasExtraAttributes;
+use Sylament\Support\Components\ViewComponent;
+use Sylament\Support\Evaluation\ClosureParameter;
 
 class Component extends ViewComponent
 {
@@ -28,6 +29,7 @@ class Component extends ViewComponent
     use CanGrow;
     use CanOrderColumns;
     use CanSpanColumns;
+    use HasActions;
     use HasChildComponents;
     use HasColumns;
     use HasExtraAttributes;
