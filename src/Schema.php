@@ -8,12 +8,13 @@ use Closure;
 use Sylament\Actions\Action;
 use Sylament\Actions\ActionGroup;
 use Sylament\Schemas\Components\Component;
+use Sylament\Schemas\Components\Concerns\CanAccessProperties;
+use Sylament\Schemas\Components\Concerns\HasColumns;
+use Sylament\Schemas\Components\Concerns\HasGap;
 use Sylament\Schemas\Components\Concerns\HasStateBindingModifiers;
-use Sylament\Schemas\Concerns\CanBeDisabled;
-use Sylament\Schemas\Concerns\HasColumns;
-use Sylament\Schemas\Concerns\HasGap;
 use Sylament\Schemas\Concerns\BelongsToLiveComponent;
 use Sylament\Schemas\Concerns\BelongsToParentComponent;
+use Sylament\Schemas\Concerns\CanBeDisabled;
 use Sylament\Schemas\Concerns\CanBeEmbeddedInParentComponent;
 use Sylament\Schemas\Concerns\CanBeInline;
 use Sylament\Schemas\Concerns\CanModifyActions;
@@ -35,6 +36,7 @@ class Schema extends ViewComponent
 {
     use BelongsToLiveComponent;
     use BelongsToParentComponent;
+    use CanAccessProperties;
     use CanBeDisabled;
     use CanBeEmbeddedInParentComponent;
     use CanBeInline;
@@ -53,7 +55,7 @@ class Schema extends ViewComponent
 
     protected string $evaluationIdentifier = 'schema';
 
-    protected string|Closure|null $template = '@SylamentSchemas/components/Schema.html.twig';
+    protected string|Closure|null $template = '@SylamentSchemas/partials/Schema/index.html.twig';
 
     public static function make(?InteractsWithSchemas $liveComponent = null): static
     {
@@ -144,11 +146,6 @@ class Schema extends ViewComponent
         return $this->getParentComponent()?->getAllColumns() ?? $this->getOwnAllColumns();
     }
 
-    /**
-     * Renders nothing when no child is visible — Filament's `renderEmbeddedHtml()`
-     * returns `''` in that case, which is what lets `Section` suppress an empty
-     * slot's chrome.
-     */
     public function render(Environment $twig): ?string
     {
         if ($this->getComponents(withHidden: false) === []) {

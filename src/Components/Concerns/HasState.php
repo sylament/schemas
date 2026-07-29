@@ -6,10 +6,9 @@ namespace Sylament\Schemas\Components\Concerns;
 
 use Closure;
 use Sylament\Schemas\Components\Component;
-use Sylament\Schemas\Components\StateCasts\Contracts\StateCast;
-use Sylament\Schemas\Components\Utilities\Get;
-use Sylament\Schemas\Components\Utilities\Set;
-use Sylament\Schemas\State\PropertyAccessor;
+use Sylament\Schemas\State\Casts\Contracts\StateCast;
+use Sylament\Schemas\State\Get;
+use Sylament\Schemas\State\Set;
 
 use function Sylament\Support\blank;
 use function Sylament\Support\filled;
@@ -102,7 +101,7 @@ trait HasState
             return null;
         }
 
-        return PropertyAccessor::getInstance()->get($this->getLiveComponent(), $statePath);
+        return $this->getPropertyAccessor()->get($this->getLiveComponent(), $statePath);
     }
 
     public function rawState(mixed $state): static
@@ -113,7 +112,7 @@ trait HasState
             return $this;
         }
 
-        PropertyAccessor::getInstance()->set($this->getLiveComponent(), $statePath, $this->evaluate($state));
+        $this->getPropertyAccessor()->set($this->getLiveComponent(), $statePath, $this->evaluate($state));
 
         return $this;
     }
@@ -431,7 +430,7 @@ trait HasState
             $statePath = $this->getStatePath();
 
             if ($statePath !== null) {
-                PropertyAccessor::getInstance()->setInArray($state, $statePath, $this->getState());
+                $this->getPropertyAccessor()->setInArray($state, $statePath, $this->getState());
             }
         }
 
@@ -483,30 +482,24 @@ trait HasState
                 }
 
                 if ($this->getRootContainer()->hasDehydratedComponent($statePath)) {
-                    // Another dehydrated component owns this exact path — leave the key intact.
                     return;
                 }
 
                 if ($this->hasComponentWithStatePath($statePath)) {
-                    // A sibling shares this path: removing the whole key would
-                    // destroy its data, so forget only this component's descendants…
-                    PropertyAccessor::getInstance()->forgetFromArray($state, $this->getDescendantStatePathsToForget($statePath));
+                    $this->getPropertyAccessor()->forgetFromArray($state, $this->getDescendantStatePathsToForget($statePath));
 
-                    // …then clean up the shared parent when nothing meaningful remains.
-                    if (blank(PropertyAccessor::getInstance()->getFromArray($state, $statePath))) {
-                        PropertyAccessor::getInstance()->forgetFromArray($state, $statePath);
+                    if (blank($this->getPropertyAccessor()->getFromArray($state, $statePath))) {
+                        $this->getPropertyAccessor()->forgetFromArray($state, $statePath);
                     }
 
                     return;
                 }
 
-                PropertyAccessor::getInstance()->forgetFromArray($state, $statePath);
+                $this->getPropertyAccessor()->forgetFromArray($state, $statePath);
 
                 return;
             }
 
-            // A pathless (layout) component: recurse into children telling them
-            // they are not dehydrated, so their descendants get pruned too.
             foreach ($this->getChildSchemas() as $childSchema) {
                 $childSchema->dehydrateState($state, isDehydrated: false);
             }
@@ -525,8 +518,8 @@ trait HasState
                 return;
             }
 
-            foreach ($this->getStateToDehydrate(PropertyAccessor::getInstance()->getFromArray($state, $statePath)) as $key => $value) {
-                PropertyAccessor::getInstance()->setInArray($state, $key, $value);
+            foreach ($this->getStateToDehydrate($this->getPropertyAccessor()->getFromArray($state, $statePath)) as $key => $value) {
+                $this->getPropertyAccessor()->setInArray($state, $key, $value);
             }
         }
     }

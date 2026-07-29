@@ -4,8 +4,8 @@ declare(strict_types=1);
 
 namespace Sylament\Schemas\Concerns;
 
-use Sylament\Schemas\Contracts\InteractsWithSchemas;
 use RuntimeException;
+use Sylament\Schemas\Contracts\InteractsWithSchemas;
 
 trait BelongsToLiveComponent
 {
@@ -27,11 +27,6 @@ trait BelongsToLiveComponent
         return $this->liveComponent;
     }
 
-    /**
-     * The nullable twin of {@see getLiveComponent()}, for callers probing an
-     * optional binding (the action-side live-component chain) rather than
-     * requiring one.
-     */
     public function getLiveComponentOrNull(): ?InteractsWithSchemas
     {
         return $this->liveComponent;

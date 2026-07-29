@@ -2,10 +2,9 @@
 
 declare(strict_types=1);
 
-namespace Sylament\Schemas\Components\Utilities;
+namespace Sylament\Schemas\State;
 
 use Sylament\Schemas\Components\Component;
-use Sylament\Schemas\State\PropertyAccessor;
 
 final class Get
 {
@@ -14,7 +13,6 @@ final class Get
     public function __construct(
         private readonly Component $component,
     ) {
-        //
     }
 
     public function __invoke(string|Component $path = '', bool $isAbsolute = false): mixed
@@ -31,7 +29,7 @@ final class Get
             );
 
         if (!$component instanceof Component) {
-            return PropertyAccessor::getInstance()->get($liveComponent, $path);
+            return $this->component->getPropertyAccessor()->get($liveComponent, $path);
         }
 
         return $component->getState();

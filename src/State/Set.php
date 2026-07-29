@@ -2,10 +2,9 @@
 
 declare(strict_types=1);
 
-namespace Sylament\Schemas\Components\Utilities;
+namespace Sylament\Schemas\State;
 
 use Sylament\Schemas\Components\Component;
-use Sylament\Schemas\State\PropertyAccessor;
 
 final class Set
 {
@@ -14,7 +13,6 @@ final class Set
     public function __construct(
         private readonly Component $component,
     ) {
-        //
     }
 
     public function __invoke(string|Component $path, mixed $state, bool $isAbsolute = false, bool $shouldCallUpdatedHooks = false): mixed
@@ -39,7 +37,7 @@ final class Set
                 $component->callAfterStateUpdatedHooks();
             }
         } else {
-            PropertyAccessor::getInstance()->set($liveComponent, $path, $state);
+            $this->component->getPropertyAccessor()->set($liveComponent, $path, $state);
         }
 
         return $state;
