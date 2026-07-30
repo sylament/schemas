@@ -1,0 +1,5 @@
+<div {{ attrs({
+    class: ['sy', 'sy-sc-group'],
+}, component.getExtraAttributes, component.getId ? {id: component.getId} : null) }}>
+    {{ renderComponent(component.getChildSchema) }}
+</div>
