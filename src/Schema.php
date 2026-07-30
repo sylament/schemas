@@ -14,6 +14,7 @@ use Sylament\Schemas\Components\Concerns\HasGap;
 use Sylament\Schemas\Components\Concerns\HasStateBindingModifiers;
 use Sylament\Schemas\Concerns\BelongsToLiveComponent;
 use Sylament\Schemas\Concerns\BelongsToParentComponent;
+use Sylament\Schemas\Concerns\BelongsToRecord;
 use Sylament\Schemas\Concerns\CanBeDisabled;
 use Sylament\Schemas\Concerns\CanBeEmbeddedInParentComponent;
 use Sylament\Schemas\Concerns\CanBeInline;
@@ -22,6 +23,7 @@ use Sylament\Schemas\Concerns\CanModifyActions;
 use Sylament\Schemas\Concerns\HasComponents;
 use Sylament\Schemas\Concerns\HasHeadings;
 use Sylament\Schemas\Concerns\HasKey;
+use Sylament\Schemas\Concerns\HasOperation;
 use Sylament\Schemas\Concerns\HasState;
 use Sylament\Schemas\Contracts\InteractsWithSchemas;
 use Sylament\Support\Components\Concerns\HasAlignment;
@@ -37,6 +39,7 @@ class Schema extends ViewComponent
 {
     use BelongsToLiveComponent;
     use BelongsToParentComponent;
+    use BelongsToRecord;
     use CanAccessProperties;
     use CanBeDisabled;
     use CanBeEmbeddedInParentComponent;
@@ -52,6 +55,7 @@ class Schema extends ViewComponent
     use HasGap;
     use HasHeadings;
     use HasKey;
+    use HasOperation;
     use HasState;
     use HasStateBindingModifiers;
 
@@ -75,8 +79,20 @@ class Schema extends ViewComponent
         return match ($parameterName) {
             'container' => ClosureParameter::make($this),
             'liveComponent' => ClosureParameter::make($this->liveComponent),
+            'record' => ClosureParameter::make($this->getRecord()),
             default => parent::resolveDefaultClosureDependencyForEvaluationByName($parameterName),
         };
+    }
+
+    protected function resolveDefaultClosureDependencyForEvaluationByType(string $parameterType): ?ClosureParameter
+    {
+        $record = $this->getRecord();
+
+        if ($record instanceof $parameterType) {
+            return ClosureParameter::make($record);
+        }
+
+        return parent::resolveDefaultClosureDependencyForEvaluationByType($parameterType);
     }
 
     public function isLive(): bool
