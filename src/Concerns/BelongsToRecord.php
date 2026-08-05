@@ -100,20 +100,29 @@ trait BelongsToRecord
      * The record-relative dotted paths this schema maps, keyed to their leaf
      * components. Containers (components nesting path-bearing components)
      * contribute their leaves, never themselves; the root state path prefix is
-     * stripped by {@see Component::getRecordStatePath()}.
+     * stripped by {@see Component::getRecordStatePath()}. A component owning its
+     * record subtree ({@see Component::ownsRecordSubtree()}) is the exception —
+     * it maps as a leaf despite its path-bearing descendants, and every path
+     * collected beneath it drops out in favour of its own.
      *
      * @return array<string, Component>
+     *
+     * @throws LogicException when a component declared outside an owner's tree
+     *                        carries a state path nesting under the owner's
      */
     protected function getRecordPathMap(): array
     {
         $map = [];
+        $owners = [];
 
         foreach ($this->getFlatComponents(withActions: false) as $component) {
             if (! $component->hasStatePath()) {
                 continue;
             }
 
-            if ($component->hasPathBearingDescendants()) {
+            $ownsSubtree = $component->ownsRecordSubtree();
+
+            if (! $ownsSubtree && $component->hasPathBearingDescendants()) {
                 continue;
             }
 
@@ -124,9 +133,60 @@ trait BelongsToRecord
             }
 
             $map[$recordPath] = $component;
+
+            if ($ownsSubtree) {
+                $owners[$recordPath] = $component;
+            }
+        }
+
+        foreach ($owners as $ownerPath => $owner) {
+            $prefix = $ownerPath . '.';
+
+            foreach ($map as $path => $component) {
+                if ($component === $owner) {
+                    continue;
+                }
+
+                if (! str_starts_with((string) $path, $prefix)) {
+                    continue;
+                }
+
+                if (! $this->isInsideOwnerTree($component, $owner)) {
+                    throw new LogicException(sprintf(
+                        '%s declares state path "%s", which nests under "%s" — a path %s maps wholesale, so this component would neither fill nor save. Move it inside that component\'s schema, or move its state path out from under "%s".',
+                        $component::class,
+                        $path,
+                        $ownerPath,
+                        $owner::class,
+                        $ownerPath,
+                    ));
+                }
+
+                unset($map[$path]);
+            }
         }
 
         return $map;
+    }
+
+    /**
+     * Whether `$component` sits in `$owner`'s own component tree — the walk up
+     * the container chain that separates a descendant the owner speaks for from
+     * a foreign component that merely shares its path prefix.
+     */
+    private function isInsideOwnerTree(Component $component, Component $owner): bool
+    {
+        $ancestor = $component->getContainer()->getParentComponent();
+
+        while ($ancestor instanceof Component) {
+            if ($ancestor === $owner) {
+                return true;
+            }
+
+            $ancestor = $ancestor->getContainer()->getParentComponent();
+        }
+
+        return false;
     }
 
     /**
@@ -207,6 +267,10 @@ trait BelongsToRecord
      * Testing presence at the branch path itself is not enough — pruning unsets
      * only the leaf key and leaves the emptied parent behind.
      *
+     * A branch that {@see Component::ownsRecordSubtree()} declares no mapped
+     * leaf beneath it at all, so it is asked at its own path instead and never
+     * reaches this predicate.
+     *
      * @param array<string, mixed> $state
      * @param list<string>         $recordPaths
      */
@@ -235,9 +299,11 @@ trait BelongsToRecord
      * anything is written; a `dehydrated(false)` leaf is pruned from the state
      * and therefore never mapped. A {@see Component::nullWhenBlank()} branch the
      * state still carries and whose state should not exist is nulled whole
-     * before the leaf walk, which then skips every path beneath it — so a
-     * discarded branch is never built back up by one of its own leaves; a branch
-     * the state does not carry is left alone entirely
+     * before the leaf walk, which then skips its own path and every path beneath
+     * it — so a discarded branch is never built back up by one of its own leaves,
+     * nor by the wholesale value a {@see Component::ownsRecordSubtree()} branch
+     * maps at that very path; a branch the state does not carry is left alone
+     * entirely
      * ({@see hasDehydratedBranchLeaf()}).
      *
      * @throws LogicException when a declared branch names no property, or names
@@ -257,6 +323,7 @@ trait BelongsToRecord
         $recordPaths = array_map(strval(...), array_keys($this->getRecordPathMap()));
 
         $nulledPrefixes = [];
+        $nulledPaths = [];
 
         foreach ($this->getNullableBranches() as $branchPath => $component) {
             $branchPath = (string) $branchPath;
@@ -267,7 +334,9 @@ trait BelongsToRecord
                 }
             }
 
-            if (! $this->hasDehydratedBranchLeaf($state, $branchPath, $recordPaths)) {
+            $ownsSubtree = $component->ownsRecordSubtree();
+
+            if ($ownsSubtree ? ! $accessor->hasInArray($state, $branchPath) : ! $this->hasDehydratedBranchLeaf($state, $branchPath, $recordPaths)) {
                 continue;
             }
 
@@ -290,9 +359,14 @@ trait BelongsToRecord
 
             $accessor->setOnRecord($record, $branchPath, null);
             $nulledPrefixes[] = $branchPath . '.';
+            $nulledPaths[$branchPath] = true;
         }
 
         foreach ($recordPaths as $recordPath) {
+            if (isset($nulledPaths[$recordPath])) {
+                continue;
+            }
+
             foreach ($nulledPrefixes as $prefix) {
                 if (str_starts_with($recordPath, $prefix)) {
                     continue 2;
