@@ -7,6 +7,8 @@ namespace Sylament\Schemas\Concerns;
 use Closure;
 use LogicException;
 use Sylament\Schemas\Components\Component;
+use Sylament\Schemas\Exceptions\ValidationException;
+use Sylament\Schemas\State\ViolationPathTranslator;
 use Symfony\Component\PropertyAccess\Exception\AccessException;
 
 use function Sylament\Support\filled;
@@ -108,14 +110,21 @@ trait BelongsToRecord
      * @return array<string, Component>
      *
      * @throws LogicException when a component declared outside an owner's tree
-     *                        carries a state path nesting under the owner's
+     *                        carries a state path nesting under the owner's, or
+     *                        when a component the map does not carry declares a
+     *                        relationship hook
      */
     protected function getRecordPathMap(): array
     {
         $map = [];
         $owners = [];
+        $hooked = [];
 
         foreach ($this->getFlatComponents(withActions: false) as $component) {
+            if ($component->hasLoadStateFromRelationships() || $component->hasSaveRelationships()) {
+                $hooked[] = $component;
+            }
+
             if (! $component->hasStatePath()) {
                 continue;
             }
@@ -130,6 +139,17 @@ trait BelongsToRecord
 
             if ($recordPath === null) {
                 continue;
+            }
+
+            $claimant = $map[$recordPath] ?? null;
+
+            if (($claimant instanceof Component) && ($ownsSubtree || $claimant->ownsRecordSubtree())) {
+                throw new LogicException(sprintf(
+                    '%s and %s both map record path "%s", which one of them maps wholesale — the walks route a path through a single component, so the other would neither fill nor save. Give one of them a different state path; two components entangling the same relationship() are not merged, so declare it on one of them and nest every field it maps inside that one.',
+                    $claimant::class,
+                    $component::class,
+                    $recordPath,
+                ));
             }
 
             $map[$recordPath] = $component;
@@ -166,7 +186,34 @@ trait BelongsToRecord
             }
         }
 
+        foreach ($hooked as $component) {
+            if (! in_array($component, $map, true)) {
+                $this->refuseUnmappedRelationshipHook($component);
+            }
+        }
+
         return $map;
+    }
+
+    /**
+     * Both walks consult a relationship hook only for a path the map carries, so
+     * a hook on a component the map skips could never fire — no error, no write,
+     * no trace. Refuse it at map time instead, naming which of the three
+     * exclusions this component met and the way back into the map.
+     *
+     * @throws LogicException always
+     */
+    private function refuseUnmappedRelationshipHook(Component $component): never
+    {
+        throw new LogicException(sprintf(
+            '%s declares a relationship hook, but the record path map does not carry it, so the hook could never fire — %s',
+            $component::class,
+            match (true) {
+                $component->getRecordStatePath() === null => 'it names no record path. Give it the statePath() of the association it maps, or drop the hook.',
+                $component->hasPathBearingDescendants() && ! $component->ownsRecordSubtree() => 'the map takes the paths of the components nested inside it instead of its own. Declare ownsRecordSubtree() so it maps whole, or drop the hook.',
+                default => 'a component above it owns its record subtree and speaks for every path beneath. Move it out from under that component, or drop the hook.',
+            },
+        ));
     }
 
     /**
@@ -197,7 +244,8 @@ trait BelongsToRecord
      * @return array<string, Component>
      *
      * @throws LogicException when a component declares itself a nullable branch
-     *                        without a state path naming the property to null
+     *                        without a state path naming the property to null,
+     *                        or alongside a relationship save hook
      */
     protected function getNullableBranches(): array
     {
@@ -206,6 +254,13 @@ trait BelongsToRecord
         foreach ($this->getFlatComponents(withActions: false) as $component) {
             if (! $component->isNullableBranch()) {
                 continue;
+            }
+
+            if ($component->hasSaveRelationships()) {
+                throw new LogicException(sprintf(
+                    '%s declares nullWhenBlank() alongside a relationship save hook — the hook owns what an empty submission means, so the two cannot compose. Drop nullWhenBlank() or the relationship.',
+                    $component::class,
+                ));
             }
 
             $recordPath = $component->getRecordStatePath();
@@ -229,7 +284,9 @@ trait BelongsToRecord
      * Read this schema's declared leaf paths off a record, traversing its
      * object graph. Unreadable and uninitialized properties are skipped, as
      * are object-valued leaves — the null-fill pass supplies those keys; a
-     * null or scalar intermediate supplies null.
+     * null or scalar intermediate supplies null. A component declaring
+     * {@see Component::loadStateFromRelationshipsUsing()} supplies its own
+     * value instead, so neither skip applies to its path.
      *
      * @return array<string, mixed>
      */
@@ -238,7 +295,15 @@ trait BelongsToRecord
         $accessor = $this->getPropertyAccessor();
         $state = [];
 
-        foreach (array_map(strval(...), array_keys($this->getRecordPathMap())) as $recordPath) {
+        foreach ($this->getRecordPathMap() as $recordPath => $component) {
+            $recordPath = (string) $recordPath;
+
+            if ($component->hasLoadStateFromRelationships()) {
+                $accessor->setInArray($state, $recordPath, $component->loadStateFromRelationships($record));
+
+                continue;
+            }
+
             try {
                 $value = $accessor->getFromRecord($record, $recordPath);
             } catch (AccessException) {
@@ -253,6 +318,15 @@ trait BelongsToRecord
         }
 
         return $state;
+    }
+
+    /**
+     * The inverse of the mapping walk, handed to the host so a violation raised
+     * against the mapped record can be spoken back in this schema's state paths.
+     */
+    public function getRecordViolationPathTranslator(): ViolationPathTranslator
+    {
+        return new ViolationPathTranslator($this->getRecordPathMap(), $this->getStatePath());
     }
 
     /**
@@ -304,10 +378,24 @@ trait BelongsToRecord
      * nor by the wholesale value a {@see Component::ownsRecordSubtree()} branch
      * maps at that very path; a branch the state does not carry is left alone
      * entirely
-     * ({@see hasDehydratedBranchLeaf()}).
+     * ({@see hasDehydratedBranchLeaf()}). A leaf whose component declares
+     * {@see Component::saveRelationshipsUsing()} is handed to that hook instead
+     * of written through the accessor, so the hook owns the write and the
+     * object-collection refusal never applies to its path — a hook on a
+     * component the map does not carry is refused rather than skipped.
      *
-     * @throws LogicException when a declared branch names no property, or names
-     *                        one the record declares non-nullable
+     * The written record is then validated in its own right, so the constraint
+     * metadata it declares — including the class-level ones a per-path run can
+     * never reach — is answered against the object the mapping produced rather
+     * than against raw state.
+     *
+     * @throws LogicException     when a declared branch names no property, names
+     *                            one the record declares non-nullable, or composes
+     *                            with a relationship save hook, or when a component
+     *                            the record path map excludes declares one
+     * @throws ValidationException when the mapped record violates a constraint it
+     *                             declares — the record stays mutated, nothing here
+     *                             having been flushed
      */
     public function getData(): object
     {
@@ -320,7 +408,8 @@ trait BelongsToRecord
 
         $accessor = $this->getPropertyAccessor();
         $state = $this->getState();
-        $recordPaths = array_map(strval(...), array_keys($this->getRecordPathMap()));
+        $map = $this->getRecordPathMap();
+        $recordPaths = array_map(strval(...), array_keys($map));
 
         $nulledPrefixes = [];
         $nulledPaths = [];
@@ -377,8 +466,16 @@ trait BelongsToRecord
                 continue;
             }
 
+            if ($map[$recordPath]->hasSaveRelationships()) {
+                $map[$recordPath]->saveRelationships($record, $accessor->getFromArray($state, $recordPath));
+
+                continue;
+            }
+
             $accessor->setOnRecord($record, $recordPath, $accessor->getFromArray($state, $recordPath));
         }
+
+        $this->getLiveComponentOrNull()?->validateSchemaRecord($this, $record);
 
         return $record;
     }

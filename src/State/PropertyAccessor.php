@@ -178,6 +178,21 @@ final readonly class PropertyAccessor
     }
 
     /**
+     * Write an association value straight onto a record property, bypassing the
+     * object-collection refusal {@see setOnRecord()} raises. That refusal exists
+     * because a plain state array carries no identity for its items; an
+     * association write carries entities, and the identity is the mapping's own.
+     * A collection-valued association takes the whole desired list — Symfony's
+     * accessor diffs it against what the property holds and calls the record's
+     * adder and remover per element, so the collection instance survives and
+     * Doctrine sees only the difference.
+     */
+    public function setAssociationOnRecord(object $record, string $property, mixed $value): void
+    {
+        $this->accessor->setValue($record, $property, $value);
+    }
+
+    /**
      * Whether the record's declared write-side type at a dotted path accepts
      * null, so a caller about to write one there can refuse first with a message
      * of its own rather than letting Symfony raise a bare type error. True when
@@ -191,6 +206,34 @@ final readonly class PropertyAccessor
         $target = $this->typeReader->describe($recordClass, $path);
 
         return ! $target instanceof RecordTarget || $target->isNullable;
+    }
+
+    /**
+     * Build a record the mapper has to create for itself, refusing a class whose
+     * constructor requires arguments — the mapper has nothing to pass it. The two
+     * clauses that differ per caller come in: `$subject` is what is being mapped,
+     * in the "Cannot map …" position, and `$advice` closes the refusal with what
+     * to do instead.
+     *
+     * @param class-string $class
+     *
+     * @throws LogicException when the class cannot be built without arguments
+     */
+    public function constructRecord(string $class, string $subject, string $advice): object
+    {
+        $reflection = new ReflectionClass($class);
+        $constructor = $reflection->getConstructor();
+
+        if (($constructor !== null) && $constructor->getNumberOfRequiredParameters() > 0) {
+            throw new LogicException(sprintf(
+                'Cannot map %s: %s requires constructor arguments, so the mapper cannot build it. Give the constructor defaults, or %s',
+                $subject,
+                $class,
+                $advice,
+            ));
+        }
+
+        return $reflection->newInstance();
     }
 
     /**
@@ -342,25 +385,16 @@ final readonly class PropertyAccessor
             return null;
         }
 
-        $reflection = new ReflectionClass($target->objectClass);
-        $constructor = $reflection->getConstructor();
-
-        if ($constructor !== null && $constructor->getNumberOfRequiredParameters() > 0) {
-            throw new LogicException(sprintf(
-                'Cannot map state path "%s" onto %s: %s requires constructor arguments, so the mapper cannot build it. Give the constructor defaults, or initialize "%s" before mapping.',
-                $path,
-                $holder::class,
-                $target->objectClass,
-                $segment,
-            ));
-        }
-
-        return $reflection->newInstance();
+        return $this->constructRecord(
+            $target->objectClass,
+            sprintf('state path "%s" onto %s', $path, $holder::class),
+            sprintf('initialize "%s" before mapping.', $segment),
+        );
     }
 
     /**
      * @throws LogicException when the record declares a collection at a mapped
-     *                        path, which has no supported item identity yet
+     *                        path, where state items carry no record identity
      */
     private function assertNotCollection(RecordTarget $target, object $holder, string $segment, string $path): void
     {
@@ -374,7 +408,7 @@ final readonly class PropertyAccessor
     private function refuseCollection(object $holder, string $segment, string $path): never
     {
         throw new LogicException(sprintf(
-            'Cannot map state path "%s" onto %s: "%s" is an object collection. Collection items need identity mapping (which state item is which entity), which arrives with the Doctrine relationship layer — the Repeater maps plain-array items only. Until then, map this property by hand after getData().',
+            'Cannot map state path "%s" onto %s: "%s" is an object collection. Collection items need identity mapping (which state item is which entity), which only a Repeater declaring relationship() supplies — the Repeater maps plain-array items otherwise. Declare relationship() on the component bound to this property, or map it by hand after getData().',
             $path,
             $holder::class,
             $segment,
