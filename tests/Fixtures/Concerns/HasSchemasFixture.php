@@ -16,12 +16,22 @@ class HasSchemasFixture implements InteractsWithSchemas
     public function schema(Schema $schema): Schema
     {
         return $schema->components([
-            new Component(),
+            new Component()->statePath('title'),
         ]);
     }
 
     public function notASchema(Schema $schema): string
     {
         return 'not a schema';
+    }
+
+    /**
+     * Schema-shaped on its first parameter and unreachable all the same:
+     * `getSchema()` passes one argument, so calling this would be an
+     * `ArgumentCountError`.
+     */
+    public function secondRequiredParameter(Schema $schema, object $record): Schema
+    {
+        return $schema;
     }
 }

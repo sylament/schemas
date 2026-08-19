@@ -22,6 +22,7 @@ use Sylament\Schemas\Concerns\CanBeValidated;
 use Sylament\Schemas\Concerns\CanModifyActions;
 use Sylament\Schemas\Concerns\Cloneable;
 use Sylament\Schemas\Concerns\HasComponents;
+use Sylament\Schemas\Concerns\HasFieldWrapper;
 use Sylament\Schemas\Concerns\HasHeadings;
 use Sylament\Schemas\Concerns\HasKey;
 use Sylament\Schemas\Concerns\HasOperation;
@@ -54,6 +55,7 @@ class Schema extends ViewComponent
     }
     use HasComponents;
     use HasExtraAttributes;
+    use HasFieldWrapper;
     use HasGap;
     use HasHeadings;
     use HasKey;
@@ -164,6 +166,17 @@ class Schema extends ViewComponent
     public function getAllColumns(): array
     {
         return $this->getParentComponent()?->getAllColumns() ?? $this->getOwnAllColumns();
+    }
+
+    /**
+     * Tell the browser to drop whatever client-side state the components of this schema
+     * hold — an open tab, a wizard step — and return to the state the server renders.
+     */
+    public function dispatchClientSideStateReset(): void
+    {
+        $this->getLiveComponent()->dispatchBrowserEvent('reset-schema-component-state', [
+            'schemaKey' => $this->getKey(),
+        ]);
     }
 
     public function render(Environment $twig): ?string

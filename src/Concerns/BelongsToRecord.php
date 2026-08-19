@@ -283,7 +283,9 @@ trait BelongsToRecord
     /**
      * Read this schema's declared leaf paths off a record, traversing its
      * object graph. Unreadable and uninitialized properties are skipped, as
-     * are object-valued leaves — the null-fill pass supplies those keys; a
+     * are object-valued leaves other than one the component's state casts
+     * flatten to a non-object ({@see self::isObjectCarriedByStateCasts()}) —
+     * the null-fill pass supplies the skipped keys; a
      * null or scalar intermediate supplies null. A component declaring
      * {@see Component::loadStateFromRelationshipsUsing()} supplies its own
      * value instead, so neither skip applies to its path.
@@ -310,7 +312,7 @@ trait BelongsToRecord
                 continue;
             }
 
-            if (is_object($value)) {
+            if (is_object($value) && ! $this->isObjectCarriedByStateCasts($component, $value)) {
                 continue;
             }
 
@@ -318,6 +320,30 @@ trait BelongsToRecord
         }
 
         return $state;
+    }
+
+    /**
+     * Whether this object leaf is one the component's own state casts flatten
+     * into a non-object. The state bag is a writable `array` LiveProp and the
+     * hydrator refuses an object anywhere inside one, so the exemption from the
+     * object-value skip is exactly as wide as the cast that earns it: the chain
+     * is run here to ask, and the hydration pass behind the read runs it again
+     * to convert. A component with no cast, or one whose casts leave the value
+     * an object, is skipped and null-filled as any other object leaf is.
+     */
+    private function isObjectCarriedByStateCasts(Component $component, object $value): bool
+    {
+        $stateCasts = $component->getStateCasts();
+
+        if ($stateCasts === []) {
+            return false;
+        }
+
+        foreach ($stateCasts as $stateCast) {
+            $value = $stateCast->set($value);
+        }
+
+        return ! is_object($value);
     }
 
     /**
