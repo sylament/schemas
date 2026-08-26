@@ -2,15 +2,60 @@
 
 declare(strict_types=1);
 
+use Doctrine\ORM\EntityManager;
+use Doctrine\ORM\QueryBuilder;
 use Sylament\Schemas\State\AssociationReader;
 use Sylament\Schemas\State\AssociationTarget;
+use Sylament\Schemas\State\PropertyAccessor;
+use Sylament\Schemas\State\RecordTypeReader;
+use Sylament\Schemas\State\Relationship;
 use Sylament\Schemas\Tests\Fixtures\Doctrine\Entity\Author;
+use Sylament\Schemas\Tests\Fixtures\Doctrine\Entity\Category;
 use Sylament\Schemas\Tests\Fixtures\Doctrine\Entity\CompositePair;
 use Sylament\Schemas\Tests\Fixtures\Doctrine\Entity\Post;
 use Sylament\Schemas\Tests\Fixtures\Doctrine\Entity\PostSection;
 use Sylament\Schemas\Tests\Fixtures\Doctrine\Entity\Profile;
 use Sylament\Schemas\Tests\Fixtures\Doctrine\Entity\Tag;
 use Sylament\Schemas\Tests\Fixtures\Doctrine\EntityManagerFactory;
+use Symfony\Component\PropertyAccess\PropertyAccess;
+
+/**
+ * One manager shared by the relationship cases below, so a case that clears the
+ * identity map clears the one the reader holds. The cases above build their own.
+ */
+function entityManager(): EntityManager
+{
+    static $entityManager = null;
+
+    return $entityManager ??= EntityManagerFactory::create();
+}
+
+function reader(): AssociationReader
+{
+    return new AssociationReader(entityManager(), new PropertyAccessor(PropertyAccess::createPropertyAccessor(), new RecordTypeReader()));
+}
+
+function seededRelationshipPost(): Post
+{
+    $post = new Post();
+    $post->setTitle('Alpha');
+
+    entityManager()->persist($post);
+    entityManager()->flush();
+
+    return $post;
+}
+
+function seededRelationshipCategory(): Category
+{
+    $category = new Category();
+    $category->setName('news');
+
+    entityManager()->persist($category);
+    entityManager()->flush();
+
+    return $category;
+}
 
 it('describes a to-one association', function (): void {
     $reader = new AssociationReader(EntityManagerFactory::create());
@@ -225,4 +270,128 @@ it('persists an entity through the entity manager and flushes it', function (): 
     $entityManager->clear();
 
     expect($entityManager->find(Author::class, $id))->toBeInstanceOf(Author::class);
+});
+
+it('describes the mapping shape of every association kind', function (string $class, string $property, array $expected): void {
+    $target = reader()->describe($class, $property);
+
+    expect($target)->toBeInstanceOf(AssociationTarget::class)
+        ->and([
+            'isManyToMany' => $target?->isManyToMany,
+            'mappedBy' => $target?->mappedBy,
+            'inversedBy' => $target?->inversedBy,
+            'isNullable' => $target?->isNullable,
+            'orderBy' => $target?->orderBy,
+        ])->toBe($expected);
+})->with([
+    'owning unidirectional many-to-many' => [Post::class, 'tags', ['isManyToMany' => true, 'mappedBy' => null, 'inversedBy' => null, 'isNullable' => true, 'orderBy' => []]],
+    'owning bidirectional many-to-many' => [Post::class, 'categories', ['isManyToMany' => true, 'mappedBy' => null, 'inversedBy' => 'posts', 'isNullable' => true, 'orderBy' => []]],
+    'inverse many-to-many' => [Category::class, 'posts', ['isManyToMany' => true, 'mappedBy' => 'categories', 'inversedBy' => null, 'isNullable' => true, 'orderBy' => []]],
+    'ordered one-to-many' => [Post::class, 'sections', ['isManyToMany' => false, 'mappedBy' => 'post', 'inversedBy' => null, 'isNullable' => true, 'orderBy' => ['position' => 'ASC']]],
+    'descending one-to-many' => [Post::class, 'replies', ['isManyToMany' => false, 'mappedBy' => 'post', 'inversedBy' => null, 'isNullable' => true, 'orderBy' => ['body' => 'DESC']]],
+    'nullable to-one' => [Post::class, 'author', ['isManyToMany' => false, 'mappedBy' => null, 'inversedBy' => 'posts', 'isNullable' => true, 'orderBy' => []]],
+    'not-null to-one' => [PostSection::class, 'post', ['isManyToMany' => false, 'mappedBy' => null, 'inversedBy' => 'sections', 'isNullable' => false, 'orderBy' => []]],
+]);
+
+it('describes a relationship and refuses what a relation-scoped table cannot list', function (): void {
+    $reader = reader();
+    $post = seededRelationshipPost();
+
+    expect($reader->describeRelationship(new Relationship($post, 'tags'))->isManyToMany)->toBeTrue()
+        ->and($reader->describeRelationship(new Relationship($post, 'sections'))->mappedBy)->toBe('post')
+        ->and(fn (): AssociationTarget => $reader->describeRelationship(new Relationship($post, 'author')))->toThrow(LogicException::class, 'single-valued')
+        ->and(fn (): AssociationTarget => $reader->describeRelationship(new Relationship($post, 'nope')))->toThrow(LogicException::class, 'maps no association')
+        ->and(fn (): AssociationTarget => $reader->describeRelationship(new Relationship(new stdClass(), 'tags')))->toThrow(LogicException::class, 'not a managed entity')
+        ->and(fn (): AssociationTarget => new AssociationReader()->describeRelationship(new Relationship($post, 'tags')))->toThrow(LogicException::class, 'EntityManager');
+});
+
+it('describes a relationship whose owner is an uninitialised proxy', function (): void {
+    $reader = reader();
+    $entityManager = entityManager();
+    $id = seededRelationshipPost()->getId();
+    assert($id !== null);
+    $entityManager->clear();
+
+    $owner = $entityManager->getReference(Post::class, $id);
+    assert($owner !== null);
+
+    expect($reader->describeRelationship(new Relationship($owner, 'tags'))->targetClass)->toBe(Tag::class);
+});
+
+it('builds the relationship query rooted at the target', function (): void {
+    $reader = reader();
+    $post = seededRelationshipPost();
+
+    $tags = $reader->createRelationshipQuery(new Relationship($post, 'tags'));
+    $sections = $reader->createRelationshipQuery(new Relationship($post, 'sections'), 'section');
+    $categoryPosts = $reader->createRelationshipQuery(new Relationship(seededRelationshipCategory(), 'posts'));
+
+    expect($tags->getRootEntities())->toBe([Tag::class])
+        ->and($tags->getRootAliases())->toBe(['record'])
+        ->and($tags->getDQL())->toBe('SELECT record FROM ' . Tag::class . ' record WHERE record.id IN (SELECT sy_related.id FROM ' . Post::class . ' sy_owner JOIN sy_owner.tags sy_related WHERE sy_owner.id = :sylament_relationship_owner)')
+        ->and($tags->getParameter('sylament_relationship_owner')?->getValue())->toBe($post)
+        ->and($sections->getDQL())->toBe('SELECT section FROM ' . PostSection::class . ' section WHERE section.post = :sylament_relationship_owner')
+        ->and($sections->getDQLPart('orderBy'))->toBe([])
+        ->and($categoryPosts->getDQL())->toContain('JOIN sy_owner.posts sy_related');
+});
+
+it('builds the candidate query as the relationship query negated', function (): void {
+    $reader = reader();
+    $post = seededRelationshipPost();
+
+    expect($reader->createRelationshipCandidateQuery(new Relationship($post, 'tags'))->getDQL())->toContain('record.id NOT IN (SELECT sy_related.id')
+        ->and($reader->createRelationshipCandidateQuery(new Relationship($post, 'sections'))->getDQL())->toEndWith('WHERE record.post IS NULL OR record.post <> :sylament_relationship_owner');
+
+    $composed = $reader->createRelationshipCandidateQuery(new Relationship($post, 'sections'));
+    $composed->andWhere('record.id IN (:keys)');
+
+    expect($composed->getDQL())->toContain('WHERE (record.post IS NULL OR record.post <> :sylament_relationship_owner) AND record.id IN (:keys)');
+});
+
+it('refuses a relationship query for an owner without an identifier', function (): void {
+    expect(fn (): QueryBuilder => reader()->createRelationshipQuery(new Relationship(new Post(), 'tags')))->toThrow(LogicException::class, 'identifier');
+});
+
+it('renders the relationship shapes as SQL the driver runs', function (): void {
+    $reader = reader();
+    $post = seededRelationshipPost();
+
+    expect($reader->createRelationshipQuery(new Relationship($post, 'tags'))->getQuery()->getSQL())
+        ->toContain('INNER JOIN post_tag')
+        ->toContain('WHERE t0_.id IN (SELECT')
+        ->and($reader->createRelationshipQuery(new Relationship($post, 'sections'))->getQuery()->getSQL())
+        ->toEndWith('WHERE p0_.post_id = ?')
+        ->and($reader->createRelationshipCandidateQuery(new Relationship($post, 'tags'))->getQuery()->getSQL())
+        ->toContain('WHERE t0_.id NOT IN (SELECT')
+        ->and($reader->createRelationshipCandidateQuery(new Relationship($post, 'sections'))->getQuery()->getSQL())
+        ->toEndWith('WHERE p0_.post_id IS NULL OR p0_.post_id <> ?');
+});
+
+it('runs the relationship query against the database', function (): void {
+    $reader = reader();
+    $entityManager = entityManager();
+
+    $post = seededRelationshipPost();
+    $tag = new Tag();
+    $tag->setName('php');
+
+    $post->addTag($tag);
+    $entityManager->persist($tag);
+    $entityManager->flush();
+
+    $other = new Tag();
+    $other->setName('symfony');
+
+    $entityManager->persist($other);
+    $entityManager->flush();
+
+    /** @var list<Tag> $related */
+    $related = $reader->createRelationshipQuery(new Relationship($post, 'tags'))->getQuery()->getResult();
+
+    /** @var list<Tag> $candidates */
+    $candidates = $reader->createRelationshipCandidateQuery(new Relationship($post, 'tags'))->getQuery()->getResult();
+
+    expect(array_map(static fn (Tag $found): ?int => $found->getId(), $related))->toBe([$tag->getId()])
+        ->and(array_map(static fn (Tag $found): ?int => $found->getId(), $candidates))->toContain($other->getId())
+        ->and(array_map(static fn (Tag $found): ?int => $found->getId(), $candidates))->not->toContain($tag->getId());
 });
