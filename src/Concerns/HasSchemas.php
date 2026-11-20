@@ -17,6 +17,7 @@ use Sylament\Schemas\Components\Contracts\AcceptsUploadedFiles;
 use Sylament\Schemas\Contracts\InteractsWithSchemas;
 use Sylament\Schemas\Exceptions\ValidationException;
 use Sylament\Schemas\Schema;
+use Sylament\Schemas\State\PropertyAccessor;
 use Sylament\Schemas\Validation\PresenceGate;
 use Sylament\Schemas\Validation\RecordKeyGuard;
 use Sylament\Support\Components\Attributes\ExposedLiveComponentMethod;
@@ -35,6 +36,7 @@ use Symfony\UX\LiveComponent\ComponentToolsTrait;
 use TypeError;
 
 use function Sylament\Support\blank;
+use function Sylament\Support\filled;
 
 trait HasSchemas
 {
@@ -90,6 +92,11 @@ trait HasSchemas
         return [
             'schema',
         ];
+    }
+
+    public function getDefaultTestingSchemaName(): ?string
+    {
+        return array_first($this->schemas());
     }
 
     public function getSchemasHostId(): string
@@ -340,6 +347,16 @@ trait HasSchemas
     #[PreDehydrate]
     public function persistOldState(): void
     {
+        foreach ($this->getCachedSchemas() as $schema) {
+            foreach ($schema->getFlatComponents(withActions: false) as $component) {
+                if (!$component->hasStatePath()) {
+                    continue;
+                }
+
+                $this->createMissingStateContainers($schema->getPropertyAccessor(), $component);
+            }
+        }
+
         $oldState = [];
 
         foreach ($this->getCachedSchemas() as $schema) {
@@ -353,6 +370,60 @@ trait HasSchemas
         }
 
         $this->oldState = $oldState;
+    }
+
+    /**
+     * Start every missing or `null` level the component's state path crosses below
+     * an array as `[]`, because UX's hydrator drops a client write below such a
+     * level. Each level is a key of the component's own path but its last, of an
+     * ancestor component's path or of the root schema's, or an item schema's whole
+     * key, below the absolute path of what holds it. An item whose key holds a dot
+     * starts none, since no dotted path reaches it.
+     */
+    private function createMissingStateContainers(PropertyAccessor $propertyAccessor, Component $component): void
+    {
+        $keys = explode('.', (string) $component->getStatePath(isAbsolute: false));
+        array_pop($keys);
+        $schema = $component->getContainer();
+        $relativePaths = [[(string) $schema->getStatePath(), $keys]];
+
+        while (($parentComponent = $schema->getParentComponent()) instanceof Component) {
+            $itemKey = $schema->getStatePath(isAbsolute: false);
+
+            if (str_contains((string) $itemKey, '.')) {
+                return;
+            }
+
+            if (filled($itemKey)) {
+                $relativePaths[] = [(string) $parentComponent->getStatePath(), [$itemKey]];
+            }
+
+            $schema = $parentComponent->getContainer();
+
+            if (filled($parentPath = $parentComponent->getStatePath(isAbsolute: false))) {
+                $relativePaths[] = [(string) $schema->getStatePath(), explode('.', $parentPath)];
+            }
+        }
+
+        if (filled($rootPath = $schema->getStatePath(isAbsolute: false))) {
+            $relativePaths[] = ['', explode('.', $rootPath)];
+        }
+
+        foreach (array_reverse($relativePaths) as [$path, $keys]) {
+            foreach ($keys as $key) {
+                if ($path !== '') {
+                    if (!is_array($propertyAccessor->get($this, $path))) {
+                        return;
+                    }
+
+                    if ($propertyAccessor->get($this, "{$path}.{$key}") === null) {
+                        $propertyAccessor->set($this, "{$path}.{$key}", []);
+                    }
+                }
+
+                $path = ($path === '') ? $key : "{$path}.{$key}";
+            }
+        }
     }
 
     #[PostHydrate(priority: -10)]
