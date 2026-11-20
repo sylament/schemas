@@ -18,9 +18,12 @@ use Sylament\Schemas\Contracts\InteractsWithSchemas;
 use Sylament\Schemas\Exceptions\ValidationException;
 use Sylament\Schemas\Schema;
 use Sylament\Schemas\Validation\PresenceGate;
+use Sylament\Schemas\Validation\RecordKeyGuard;
 use Sylament\Support\Components\Attributes\ExposedLiveComponentMethod;
 use Symfony\Component\HttpFoundation\File\UploadedFile;
 use Symfony\Component\HttpFoundation\Request;
+use Symfony\Component\Validator\Constraint;
+use Symfony\Component\Validator\ConstraintViolationInterface;
 use Symfony\Component\Validator\Validator\ValidatorInterface;
 use Symfony\Contracts\Service\Attribute\Required;
 use Symfony\UX\LiveComponent\Attribute\LiveAction;
@@ -30,6 +33,8 @@ use Symfony\UX\LiveComponent\Attribute\PostHydrate;
 use Symfony\UX\LiveComponent\Attribute\PreDehydrate;
 use Symfony\UX\LiveComponent\ComponentToolsTrait;
 use TypeError;
+
+use function Sylament\Support\blank;
 
 trait HasSchemas
 {
@@ -63,6 +68,14 @@ trait HasSchemas
      * @var array<string, array<string, list<string>>>
      */
     protected array $schemaValidationErrors = [];
+
+    /**
+     * The class of each constraint behind {@see $schemaValidationErrors}, filed under the
+     * same schema identity and state path.
+     *
+     * @var array<string, array<string, list<class-string<Constraint>>>>
+     */
+    protected array $schemaValidationErrorConstraints = [];
 
     protected ?ValidatorInterface $schemaStateValidator = null;
 
@@ -345,6 +358,8 @@ trait HasSchemas
     #[PostHydrate(priority: -10)]
     public function callAfterSchemaStateUpdated(): void
     {
+        $updatedComponents = [];
+
         foreach ($this->getCachedSchemas() as $schema) {
             foreach ($schema->getFlatComponents(withActions: false) as $component) {
                 if (!$component->hasStatePath()) {
@@ -355,8 +370,12 @@ trait HasSchemas
                     continue;
                 }
 
-                $component->callAfterStateUpdatedHooks();
+                $updatedComponents[] = $component;
             }
+        }
+
+        foreach ($updatedComponents as $component) {
+            $component->callAfterStateUpdatedHooks();
         }
     }
 
@@ -391,6 +410,7 @@ trait HasSchemas
             ?? throw new LogicException('No validator injected into ' . static::class . ' — the container calls setSchemaStateValidator(); a host built with `new` must inject one itself.');
 
         $errors = [];
+        $errorConstraints = [];
         $constraintsByPath = $schema->getValidationConstraints();
 
         $state = [];
@@ -407,6 +427,7 @@ trait HasSchemas
 
             foreach ($violations as $violation) {
                 $errors[$path][] = (string) $violation->getMessage();
+                $this->collectErrorConstraint($errorConstraints, $path, $violation);
             }
         }
 
@@ -415,7 +436,7 @@ trait HasSchemas
         }
 
         if ($errors === []) {
-            unset($this->schemaValidationErrors[$schemaKey]);
+            $this->forgetSchemaValidationErrors($schemaKey);
 
             if ($shouldThrow) {
                 $this->validatedSchemas = array_values(array_diff($this->validatedSchemas, [$schemaKey]));
@@ -425,6 +446,7 @@ trait HasSchemas
         }
 
         $this->schemaValidationErrors[$schemaKey] = $errors;
+        $this->schemaValidationErrorConstraints[$schemaKey] = $errorConstraints;
 
         if (!$shouldThrow) {
             return;
@@ -451,8 +473,9 @@ trait HasSchemas
     {
         $key = $schema->getParentComponent()?->getKey() ?? $schema->getKey();
 
-        return $key
-            ?? throw new LogicException('Cannot validate a schema without a key — register it through getSchema()/cacheSchema() so it is keyed, or validate a keyed component\'s child schema.');
+        return !blank($key)
+            ? $key
+            : throw new LogicException("Cannot validate a schema without a key — register it through getSchema()/cacheSchema() so it is keyed, or validate a keyed component's child schema.");
     }
 
     /**
@@ -470,8 +493,34 @@ trait HasSchemas
 
         foreach (array_keys($this->schemaValidationErrors) as $key) {
             if (str_starts_with($key, $prefix)) {
-                unset($this->schemaValidationErrors[$key]);
+                $this->forgetSchemaValidationErrors($key);
             }
+        }
+    }
+
+    private function forgetSchemaValidationErrors(string $schemaKey): void
+    {
+        unset($this->schemaValidationErrors[$schemaKey], $this->schemaValidationErrorConstraints[$schemaKey]);
+    }
+
+    /**
+     * Every path a violation lands on gets its entry, so a merge replaces a path's
+     * classes wherever it replaces its messages; a violation built without a constraint
+     * has no class to keep.
+     *
+     * @param array<string, list<class-string<Constraint>>> $errorConstraints
+     */
+    private function collectErrorConstraint(array &$errorConstraints, string $path, ConstraintViolationInterface $violation): void
+    {
+        $errorConstraints[$path] ??= [];
+        $constraint = $violation->getConstraint();
+
+        if (!$constraint instanceof Constraint) {
+            return;
+        }
+
+        if (!in_array($constraint::class, $errorConstraints[$path], true)) {
+            $errorConstraints[$path][] = $constraint::class;
         }
     }
 
@@ -483,7 +532,18 @@ trait HasSchemas
 
         $schemaKey = $this->getSchemaValidationKey($schema);
 
-        $violations = $this->schemaStateValidator->validate($record);
+        $reader = $schema->getAssociationReader();
+
+        $violations = $this->schemaStateValidator->validate($record, RecordKeyGuard::constraint($reader->revertIdentifierChanges($record)));
+        $violations->addAll($this->schemaStateValidator->validate($record));
+
+        if (count($violations) === 0 && $schema->isRecordKeyValidated()) {
+            $violations = $this->schemaStateValidator->validate($record, RecordKeyGuard::constraint($this->getMappedBlankIdentifier($schema, $reader->findBlankAssignedIdentifiers($record))));
+
+            if (count($violations) === 0) {
+                $violations = $this->schemaStateValidator->validate($record, RecordKeyGuard::constraint($this->getMappedTakenIdentifiers($schema, $reader->findTakenIdentifiers($record))));
+            }
+        }
 
         if (count($violations) === 0) {
             return;
@@ -493,16 +553,26 @@ trait HasSchemas
         $rootPath = (string) $schema->getStatePath();
 
         $errors = [];
+        $errorConstraints = [];
 
         foreach ($violations as $violation) {
-            $path = $translator->translate($violation->getPropertyPath()) ?? $rootPath;
+            $path = $translator->translateToErrorPath($violation->getPropertyPath()) ?? $rootPath;
+            $message = (string) $violation->getMessage();
 
-            $errors[$path][] = (string) $violation->getMessage();
+            if (!in_array($message, $errors[$path] ?? [], true)) {
+                $errors[$path][] = $message;
+            }
+
+            $this->collectErrorConstraint($errorConstraints, $path, $violation);
         }
 
         $this->schemaValidationErrors[$schemaKey] = [
             ...$this->schemaValidationErrors[$schemaKey] ?? [],
             ...$errors,
+        ];
+        $this->schemaValidationErrorConstraints[$schemaKey] = [
+            ...$this->schemaValidationErrorConstraints[$schemaKey] ?? [],
+            ...$errorConstraints,
         ];
 
         if (!in_array($schemaKey, $this->validatedSchemas, true)) {
@@ -510,6 +580,61 @@ trait HasSchemas
         }
 
         throw new ValidationException($errors);
+    }
+
+    /**
+     * The first blank-key candidate a component of the schema maps, or none.
+     *
+     * @param array<string, string> $candidates the refusal, keyed by each candidate field in the order the rule picks from
+     *
+     * @return array<string, string>
+     */
+    private function getMappedBlankIdentifier(Schema $schema, array $candidates): array
+    {
+        if ($candidates === []) {
+            return [];
+        }
+
+        $translator = $schema->getRecordViolationPathTranslator();
+        $field = array_find_key($candidates, static fn (string $message, string $field): bool => $translator->translate($field) !== null);
+
+        return $field === null ? [] : [$field => $candidates[$field]];
+    }
+
+    /**
+     * Each taken record's candidates a component of the schema maps or, where it
+     * maps none of a record's, that record's first: a record's candidates share
+     * the property path up to their last segment, and a candidate that
+     * translates only to the record's own path, through the component mapping
+     * the record, is not mapped.
+     *
+     * @param array<string, string> $candidates the refusal, keyed by each candidate field, a taken record's together in identifier order
+     *
+     * @return array<string, string>
+     */
+    private function getMappedTakenIdentifiers(Schema $schema, array $candidates): array
+    {
+        if ($candidates === []) {
+            return [];
+        }
+
+        $translator = $schema->getRecordViolationPathTranslator();
+        $byRecord = [];
+
+        foreach ($candidates as $field => $message) {
+            $separator = mb_strrpos($field, '.');
+            $byRecord[$separator === false ? '' : mb_substr($field, 0, $separator)][$field] = $message;
+        }
+
+        $refusals = [];
+
+        foreach ($byRecord as $prefix => $recordCandidates) {
+            $own = $prefix === '' ? null : $translator->translate($prefix);
+            $mapped = array_filter($recordCandidates, static fn (string $field): bool => ($translation = $translator->translate($field)) !== null && $translation !== $own, ARRAY_FILTER_USE_KEY);
+            $refusals = [...$refusals, ...($mapped === [] ? array_slice($recordCandidates, 0, 1, true) : $mapped)];
+        }
+
+        return $refusals;
     }
 
     /**
@@ -530,17 +655,36 @@ trait HasSchemas
         return array_values(array_unique($messages));
     }
 
+    /**
+     * @return list<class-string<Constraint>>
+     */
+    public function getErrorConstraintsForSchemaStatePath(?string $path): array
+    {
+        if ($path === null) {
+            return [];
+        }
+
+        $constraints = [];
+
+        foreach ($this->schemaValidationErrorConstraints as $schemaErrorConstraints) {
+            $constraints = [...$constraints, ...($schemaErrorConstraints[$path] ?? [])];
+        }
+
+        return array_values(array_unique($constraints));
+    }
+
     public function clearSchemaValidation(?string $schemaKey = null): void
     {
         if ($schemaKey === null) {
             $this->validatedSchemas = [];
             $this->schemaValidationErrors = [];
+            $this->schemaValidationErrorConstraints = [];
 
             return;
         }
 
         $this->validatedSchemas = array_values(array_diff($this->validatedSchemas, [$schemaKey]));
-        unset($this->schemaValidationErrors[$schemaKey]);
+        $this->forgetSchemaValidationErrors($schemaKey);
 
         $this->clearNestedSchemaValidation($schemaKey);
     }

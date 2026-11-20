@@ -15,7 +15,7 @@
     "require": {
         "php": "^8.5",
         "ext-mbstring": "*",
-        "doctrine/orm": "^3.6",
+        "doctrine/orm": "^3.7",
         "sylament/actions": "self.version",
         "sylament/support": "self.version",
         "symfony/http-foundation": "^8.1",
@@ -25,18 +25,13 @@
         "symfony/string": "^8.1",
         "symfony/translation-contracts": "^3.6",
         "symfony/uid": "^8.1",
-        "symfony/ux-live-component": "^3.1",
-        "symfony/ux-twig-component": "^3.1",
+        "symfony/ux-live-component": "^3.5",
+        "symfony/ux-twig-component": "^3.5",
         "symfony/validator": "^8.1"
     },
     "autoload": {
         "psr-4": {
             "Sylament\\Schemas\\": "src/"
-        }
-    },
-    "autoload-dev": {
-        "psr-4": {
-            "Sylament\\Schemas\\Tests\\": "tests/"
         }
     }
 }

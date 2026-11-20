@@ -32,6 +32,11 @@ trait HasState
      */
     protected array $afterStateUpdated = [];
 
+    /**
+     * @var array<int, array<string, true>>
+     */
+    protected array $executedAfterStateUpdatedCallbacks = [];
+
     protected bool|Closure|null $isDehydrated = null;
 
     protected bool|Closure $isSaved = true;
@@ -155,6 +160,31 @@ trait HasState
         return $this->stateCasts !== [];
     }
 
+    /**
+     * Whether this component's own state casts flatten an object leaf read off
+     * a record into a non-object — the one object a fill may put in the state
+     * bag, which is a writable `array` LiveProp the hydrator refuses an object
+     * anywhere inside. The chain is run here to ask, and the hydration pass
+     * behind the read runs it again to convert. With no cast, or casts that
+     * leave the value an object, the leaf is skipped and null-filled.
+     *
+     * @internal the object-leaf gate of every fill walk — the root read, a singular relationship's related record and a relationship repeater's items
+     */
+    public function isObjectCarriedByStateCasts(object $value): bool
+    {
+        $stateCasts = $this->getStateCasts();
+
+        if ($stateCasts === []) {
+            return false;
+        }
+
+        foreach ($stateCasts as $stateCast) {
+            $value = $stateCast->set($value);
+        }
+
+        return ! is_object($value);
+    }
+
     public function state(mixed $state): static
     {
         foreach (array_reverse($this->getStateCasts()) as $stateCast) {
@@ -237,12 +267,22 @@ trait HasState
      * Fire every registered `afterStateUpdated` hook. Invoked by the host's
      * `#[PostHydrate]` pass for each component whose state changed on the
      * round-trip; each hook receives the pre-change `$old` (cast) / `$oldRaw`
-     * (raw) values injected by name.
+     * (raw) values injected by name. Each hook runs once per state this
+     * component instance holds, however many writes ask for it.
      */
     public function callAfterStateUpdatedHooks(): static
     {
         foreach ($this->afterStateUpdated as $callback) {
+            $callbackId = spl_object_id($callback);
+            $state = serialize($this->getRawState());
+
+            if (isset($this->executedAfterStateUpdatedCallbacks[$callbackId][$state])) {
+                continue;
+            }
+
             $this->callAfterStateUpdatedHook($callback);
+
+            $this->executedAfterStateUpdatedCallbacks[$callbackId][$state] = true;
         }
 
         return $this;

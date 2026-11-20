@@ -4,19 +4,35 @@ declare(strict_types=1);
 
 namespace Sylament\Schemas\State;
 
+use BackedEnum;
+use Doctrine\DBAL\Types\Type;
 use Doctrine\ORM\EntityManagerInterface;
+use Doctrine\ORM\Events;
+use Doctrine\ORM\Mapping\ClassMetadata;
 use Doctrine\ORM\Mapping\InverseSideMapping;
+use Doctrine\ORM\Mapping\JoinColumnMapping;
 use Doctrine\ORM\Mapping\OwningSideMapping;
+use Doctrine\ORM\PersistentCollection;
 use Doctrine\ORM\QueryBuilder;
 use LogicException;
 use ReflectionClass;
-use Stringable;
+use SortDirection;
+use Sylament\Schemas\Identity\IdentifierConstraint;
+use Sylament\Schemas\Identity\IdentifierFields;
+use Sylament\Schemas\Identity\RecordKey;
+use Sylament\Schemas\Query\SortDirections;
 use Symfony\Component\PropertyAccess\PropertyAccess;
 
 use function Sylament\Support\blank;
 
 class AssociationReader
 {
+    private const string TAKEN_IDENTIFIER = 'This value is already used.';
+
+    private const string CHANGED_IDENTIFIER = 'This value cannot be changed.';
+
+    private const string BLANK_IDENTIFIER = 'This value should not be blank.';
+
     public function __construct(
         private readonly ?EntityManagerInterface $entityManager = null,
         private ?PropertyAccessor $propertyAccessor = null,
@@ -26,6 +42,16 @@ class AssociationReader
     public function hasEntityManager(): bool
     {
         return $this->entityManager instanceof EntityManagerInterface;
+    }
+
+    /**
+     * This reader bound to another entity manager: a clone, so its class, its
+     * property accessor and anything a subclass carries come along. A subclass
+     * that delegates to another reader rebinds that one too, by overriding this.
+     */
+    public function withEntityManager(EntityManagerInterface $entityManager): static
+    {
+        return clone($this, ['entityManager' => $entityManager]);
     }
 
     /**
@@ -55,7 +81,7 @@ class AssociationReader
         $isNullable = true;
 
         if ($mapping->isToOneOwningSide()) {
-            $isNullable = $mapping->joinColumns[0]->nullable ?? true;
+            $isNullable = array_all($mapping->joinColumns, static fn (JoinColumnMapping $joinColumn): bool => $joinColumn->nullable ?? true);
         }
 
         return new AssociationTarget(
@@ -67,7 +93,10 @@ class AssociationReader
             mappedBy: $mapping instanceof InverseSideMapping ? $mapping->mappedBy : null,
             inversedBy: $mapping instanceof OwningSideMapping ? $mapping->inversedBy : null,
             isNullable: $isNullable,
-            orderBy: $mapping->isToMany() ? $mapping->orderBy() : [],
+            orderBy: $mapping->isToMany() ? array_map(
+                static fn (SortDirection|string $direction): SortDirection => $direction instanceof SortDirection ? $direction : SortDirections::from($direction),
+                $mapping->orderBy(),
+            ) : [],
         );
     }
 
@@ -108,21 +137,40 @@ class AssociationReader
     /**
      * The owner's related records — the target entity as the single root under
      * $alias, narrowed to the owner: a one-to-many through the target's mapped-by
-     * field, a many-to-many through a subselect over the owner's own association,
-     * which needs no inverse mapping and adds no join to the outer query.
-     * Unordered: the mapping's order is the caller's default sort, not the
-     * query's.
+     * field, a many-to-many through a correlated subselect over the owner's own
+     * association, which needs no inverse mapping and adds no join to the outer
+     * query — and so does either arm of an owner keyed by several fields, whose
+     * mapped-by path DQL cannot compare. Unordered: the mapping's order is the
+     * caller's default sort, not the query's.
      */
     public function createRelationshipQuery(Relationship $relationship, string $alias = 'record'): QueryBuilder
     {
-        $target = $this->describeRelationship($relationship);
-        $query = $this->createOptionQuery($target->targetClass, $alias);
+        return $this->scopeToRelationship($this->createOptionQuery($this->describeRelationship($relationship)->targetClass, $alias), $relationship, $alias);
+    }
 
-        $query->andWhere($target->isManyToMany
-            ? sprintf('%s.%s IN (%s)', $alias, $this->getIdentifierFieldName($target->targetClass), $this->getRelatedKeysSubselect($relationship, $target))
+    /**
+     * The owner's related records as {@see createRelationshipQuery()} reads
+     * them, but narrowing $query — rooted at the relationship's target under
+     * $alias — in place, so every condition the caller's own query carries
+     * holds beside the owner's. The narrowing claims the parameter names
+     * `sylament_relationship_owner` (with `_0`, `_1`, … for an owner keyed by
+     * several fields) and the subselect aliases `sy_owner` and `sy_related`.
+     *
+     * @throws LogicException when $query has no root under $alias
+     */
+    public function scopeToRelationship(QueryBuilder $query, Relationship $relationship, string $alias = 'record'): QueryBuilder
+    {
+        $target = $this->describeRelationship($relationship);
+
+        if (! in_array($alias, $query->getRootAliases(), true)) {
+            throw new LogicException(sprintf('Cannot scope a query to the relationship [%s] of [%s]: it has no root under the alias [%s], which the scope narrows.', $relationship->name, $this->getEntityClass($relationship->owner), $alias));
+        }
+
+        $query->andWhere($this->isScopedThroughOwner($relationship, $target)
+            ? $this->getRelatedRecordsExists($query, $relationship, $target, $alias)
             : sprintf('%s.%s = :sylament_relationship_owner', $alias, $this->getMappedBy($relationship, $target)));
 
-        return $query->setParameter('sylament_relationship_owner', $this->getRelationshipOwner($relationship));
+        return $this->bindRelationshipOwner($query, $relationship);
     }
 
     /**
@@ -135,8 +183,12 @@ class AssociationReader
         $target = $this->describeRelationship($relationship);
         $query = $this->createOptionQuery($target->targetClass, $alias);
 
-        if ($target->isManyToMany) {
-            $query->andWhere(sprintf('%s.%s NOT IN (%s)', $alias, $this->getIdentifierFieldName($target->targetClass), $this->getRelatedKeysSubselect($relationship, $target)));
+        if (! $target->isManyToMany) {
+            $this->assertRelationshipAcceptsAssociate($relationship);
+        }
+
+        if ($this->isScopedThroughOwner($relationship, $target)) {
+            $query->andWhere(sprintf('NOT %s', $this->getRelatedRecordsExists($query, $relationship, $target, $alias)));
         } else {
             $mappedBy = $this->getMappedBy($relationship, $target);
 
@@ -146,7 +198,7 @@ class AssociationReader
             ));
         }
 
-        return $query->setParameter('sylament_relationship_owner', $this->getRelationshipOwner($relationship));
+        return $this->bindRelationshipOwner($query, $relationship);
     }
 
     /**
@@ -154,13 +206,15 @@ class AssociationReader
      * collection Doctrine persists — the owner's, or the target's when the owner
      * holds the inverse side, since an inverse-side write is silently ignored at
      * flush — through the record's own adder; a one-to-many points the target's
-     * mapped-by field at the owner. The caller flushes.
+     * mapped-by field at the owner, unless that write would move the record's
+     * primary key. The caller flushes.
      */
     public function attach(Relationship $relationship, object $related): void
     {
         $target = $this->describeRelationship($relationship);
 
         if (! $target->isManyToMany) {
+            $this->assertAttachKeepsIdentifier($relationship, $target, $related);
             $this->getPropertyAccessor()->setAssociationOnRecord($related, $this->getMappedBy($relationship, $target), $relationship->owner);
 
             return;
@@ -206,10 +260,34 @@ class AssociationReader
     }
 
     /**
+     * Whether an existing record may be associated into a one-to-many at all:
+     * refused when the target's mapped-by field is part of its identifier, where
+     * pointing it at this owner would move its primary key rather than move the
+     * record. A many-to-many always may.
+     *
+     * @throws LogicException when associating would re-key the target
+     */
+    public function assertRelationshipAcceptsAssociate(Relationship $relationship): void
+    {
+        $target = $this->describeRelationship($relationship);
+
+        if ($target->isManyToMany) {
+            return;
+        }
+
+        $mappedBy = $this->getMappedBy($relationship, $target);
+
+        if ($this->isIdentifierField($target->targetClass, $mappedBy)) {
+            throw $this->refuseRekeyingAssociate($relationship, $target->targetClass, $mappedBy);
+        }
+    }
+
+    /**
      * Whether a one-to-many's records may be dissociated at all: refused when the
      * mapping deletes an orphan (the owner owns these records — DeleteAction is
-     * the action), when the target's join column is NOT NULL, or when its setter
-     * or property does not accept null. A many-to-many always may.
+     * the action), when the target's mapped-by field is part of its identifier,
+     * when its join column is NOT NULL, or when its setter or property does not
+     * accept null. A many-to-many always may.
      *
      * @throws LogicException when the mapping forbids a dissociation
      */
@@ -228,6 +306,10 @@ class AssociationReader
             throw new LogicException(sprintf('[%s::$%s] declares orphanRemoval, so a record removed from it is deleted rather than dissociated — dissociating is not something the mapping permits; use DeleteAction.', $ownerClass, $relationship->name));
         }
 
+        if ($this->isIdentifierField($target->targetClass, $mappedBy)) {
+            throw new LogicException(sprintf('[%s::$%s] is part of the identifier of [%s], so a [%s] cannot be dissociated from its [%s] — nulling it would erase half the record\'s identity; use DeleteAction.', $target->targetClass, $mappedBy, $target->targetClass, $target->targetClass, $ownerClass));
+        }
+
         $owningSide = $this->describe($target->targetClass, $mappedBy);
 
         if ($owningSide instanceof AssociationTarget && ! $owningSide->isNullable) {
@@ -240,13 +322,20 @@ class AssociationReader
     }
 
     /**
-     * A managed reference to an entity, without loading it.
+     * A managed reference to an entity by the key {@see getRecordKey()} mints —
+     * a key of any width, decoded against the class's own mapping before
+     * anything is looked up, so a key no record of that class could mint is
+     * refused without a statement. A well-formed key is looked up only where the
+     * reference has to load; on a scalar identifier it becomes a lazy reference,
+     * which names no record only once something initialises it.
      *
      * @param class-string $class
+     *
+     * @throws LogicException when the key is malformed for the class, or — where the reference loads — names no record
      */
     public function getReference(string $class, int|string $id): object
     {
-        return $this->requireEntityManager()->getReference($class, $id) ?? throw new LogicException(sprintf(
+        return $this->findReference($class, (string) $id) ?? throw new LogicException(sprintf(
             'No [%s] carries the identifier [%s], so it cannot be referenced.',
             $class,
             $id,
@@ -256,61 +345,167 @@ class AssociationReader
     /**
      * The string key an option list and the client speak an entity by, read off
      * the Doctrine mapping rather than a property convention.
+     *
+     * @throws LogicException when the identifier is incomplete, or a component is not printable
      */
     public function getRecordKey(object $entity): string
     {
-        return $this->findRecordKey($entity) ?? throw new LogicException(sprintf('Object records must expose a readable non-blank identifier; [%s] has none set.', $entity::class));
+        return RecordKey::of($this->requireEntityManager(), $entity);
     }
 
     /**
      * The same key {@see getRecordKey()} answers, or null when the entity carries
-     * no identifier yet — an unflushed record, which a caller that only wants to
-     * exclude an existing row has nothing to exclude for.
+     * no complete identifier yet — an unflushed record, which a caller that only
+     * wants to exclude an existing row has nothing to exclude for.
      */
     public function findRecordKey(object $entity): ?string
     {
-        $metadata = $this->requireEntityManager()->getClassMetadata($entity::class);
-
-        if ($metadata->isIdentifierComposite) {
-            throw new LogicException(sprintf('Records of [%s] carry a composite identifier, which a relation-backed field cannot key; use single-identifier entities.', $entity::class));
-        }
-
-        $identifierValues = $metadata->getIdentifierValues($entity);
-
-        if ($identifierValues === []) {
-            return null;
-        }
-
-        $key = array_first($identifierValues);
-
-        if ($key instanceof Stringable) {
-            $key = (string) $key;
-        }
-
-        $key = is_scalar($key) ? (string) $key : null;
-
-        if (blank($key)) {
-            throw new LogicException(sprintf('The identifier of [%s] is not a printable value.', $entity::class));
-        }
-
-        return $key;
+        return RecordKey::find($this->requireEntityManager(), $entity);
     }
 
     /**
-     * The field name a single-identifier entity's identifier is mapped under —
-     * for a caller that needs the property name rather than its value.
-     *
-     * @param class-string $class
+     * Whether the record is missing an identifier component the application has
+     * to assign — asked only of an identifier of more than one field, or one
+     * carrying an association. A plain single scalar identifier is never refused
+     * here: an application may fill such a field from anywhere, including a
+     * listener no class-level mapping shows.
      */
-    public function getIdentifierFieldName(string $class): string
+    public function hasIncompleteAssignedIdentifier(object $entity): bool
     {
-        $metadata = $this->requireEntityManager()->getClassMetadata($class);
+        $metadata = $this->requireEntityManager()->getClassMetadata($entity::class);
 
-        if ($metadata->isIdentifierComposite) {
-            throw new LogicException(sprintf('Records of [%s] carry a composite identifier, which a relation-backed field cannot key; use single-identifier entities.', $class));
+        if ($this->isSingleScalarIdentifier($metadata)) {
+            return false;
         }
 
-        return $metadata->getSingleIdentifierFieldName();
+        return $this->isMissingAssignedIdentifierComponent($entity);
+    }
+
+    /**
+     * Whether a record's assigned identifier, as `persist()` left it — every
+     * prePersist callback and listener run — still has a component that is a
+     * blank string, an identifier association's own key included. A null
+     * identifier field never gets this far: Doctrine refuses a missing
+     * assigned identifier inside `persist()`, before this is asked.
+     * False for a generated identifier, for a single scalar one, and for an
+     * identifier association onto a record whose generated identifier is still
+     * pending while no scalar identifier field is blank.
+     */
+    public function hasBlankAssignedIdentifier(object $record): bool
+    {
+        $entityManager = $this->requireEntityManager();
+        $metadata = $entityManager->getClassMetadata($record::class);
+
+        if (! $metadata->isIdentifierNatural() || $this->isSingleScalarIdentifier($metadata) || RecordKey::find($entityManager, $record) !== null) {
+            return false;
+        }
+
+        return array_any($metadata->identifier, static fn (string $field): bool => ! $metadata->hasAssociation($field) && blank($metadata->getFieldValue($record, $field)))
+            || ! $this->awaitsGeneratedIdentifier($record);
+    }
+
+    /**
+     * Put back the identifier of every managed record this one's loaded
+     * associations reach — itself first — whose key no longer prints the one the
+     * unit of work keyed it by, and answer each such field: a flush would
+     * otherwise move a primary key under a unit of work still keyed by the old
+     * one, so the old key is put back on the spot and nothing flushed later
+     * moves it. Runs no statement; a collection or reference nobody loaded holds
+     * nothing a write touched, so it stays unloaded.
+     *
+     * @internal the record check behind a schema's getData() and an editable cell's write
+     *
+     * @return array<string, string> the refusal, keyed by the field's property path from the record
+     */
+    public function revertIdentifierChanges(object $record): array
+    {
+        $refusals = [];
+
+        foreach ($this->walkLoadedRecords($record) as [$path, $current, $metadata]) {
+            $unitOfWork = $this->requireEntityManager()->getUnitOfWork();
+
+            if (! $unitOfWork->isInIdentityMap($current) || $unitOfWork->isScheduledForInsert($current) || $unitOfWork->isScheduledForDelete($current)) {
+                continue;
+            }
+
+            foreach ($this->revertIdentifierChange($current, $metadata) as $field) {
+                $refusals[$this->joinPropertyPath($path, $field)] = self::CHANGED_IDENTIFIER;
+            }
+        }
+
+        return $refusals;
+    }
+
+    /**
+     * Every new record this one's loaded cascade-persist associations reach —
+     * itself first, then what the flush would insert with it — whose assigned
+     * key a stored or managed record already holds, or a new record met earlier
+     * in the same walk claims: `find()` per new record once its key is
+     * complete, the identity map first and then one SELECT. Each is answered
+     * under every field a form could let the user type, in identifier order —
+     * each identifier field that is no association, or, for an identifier with
+     * none, the first that does not point back at the record the walk arrived
+     * from, else the first.
+     *
+     * @internal the record check behind a schema's getData(), after the record's own constraints pass, which keeps the fields the schema maps; and ReplicateAction's taken-key check on its arm without a schema
+     *
+     * @return array<string, string> the refusal, keyed by each such field's property path from the record, a taken record's fields together
+     */
+    public function findTakenIdentifiers(object $record): array
+    {
+        $claimed = [];
+        $refusals = [];
+
+        foreach ($this->walkLoadedRecords($record, cascadePersistOnly: true) as [$path, $current, $metadata, $backReference]) {
+            $unitOfWork = $this->requireEntityManager()->getUnitOfWork();
+
+            if (! $metadata->isIdentifierNatural() || ($unitOfWork->isInIdentityMap($current) && ! $unitOfWork->isScheduledForInsert($current))) {
+                continue;
+            }
+
+            if ($this->isIdentifierTaken($current, $metadata, $claimed)) {
+                foreach ($this->getTakenIdentifierFields($metadata, $backReference) as $field) {
+                    $refusals[$this->joinPropertyPath($path, $field)] = self::TAKEN_IDENTIFIER;
+                }
+            }
+        }
+
+        return $refusals;
+    }
+
+    /**
+     * Every field a new record's blank assigned key could be refused under, in
+     * the order a refusal picks from: each identifier field holding a blank
+     * string — null, empty or only whitespace — then each identifier
+     * association left unset, or onto a record whose own assigned key is blank,
+     * that record's blank fields first. A prePersist callback or entity
+     * listener the class declares changes nothing here. Empty for a record the
+     * unit of work already holds, for a generated identifier and for a single
+     * scalar one.
+     *
+     * @internal the record check behind a schema's getData(), which refuses under the first candidate the schema maps
+     *
+     * @return array<string, string> the refusal, keyed by each candidate's property path from the record, in that order
+     */
+    public function findBlankAssignedIdentifiers(object $record): array
+    {
+        if (! $this->entityManager instanceof EntityManagerInterface) {
+            return [];
+        }
+
+        $metadata = $this->findEntityMetadata($this->entityManager, $record::class);
+
+        if (! $metadata instanceof ClassMetadata || ! $metadata->isIdentifierNatural() || $this->isSingleScalarIdentifier($metadata)) {
+            return [];
+        }
+
+        $unitOfWork = $this->entityManager->getUnitOfWork();
+
+        if ($unitOfWork->isInIdentityMap($record) && ! $unitOfWork->isScheduledForInsert($record)) {
+            return [];
+        }
+
+        return array_fill_keys($this->findBlankIdentifierPaths($record, $metadata, ''), self::BLANK_IDENTIFIER);
     }
 
     /**
@@ -334,6 +529,246 @@ class AssociationReader
     public function flush(): void
     {
         $this->requireEntityManager()->flush();
+    }
+
+    /**
+     * The record and every entity its loaded associations reach — or, for the
+     * taken-key rule, only those a flush would cascade-persist — each once,
+     * with its property path from the record and, for a member of an inverse
+     * collection, the field that points back at the record it was reached
+     * through. An uninitialized proxy or collection is left unloaded.
+     *
+     * @return iterable<array{string, object, ClassMetadata<object>, string|null}>
+     */
+    private function walkLoadedRecords(object $record, bool $cascadePersistOnly = false): iterable
+    {
+        if (! $this->entityManager instanceof EntityManagerInterface) {
+            return;
+        }
+
+        $entityManager = $this->entityManager;
+        $metadataByClass = [];
+        $visited = [];
+        $queue = [['', $record, null]];
+
+        for ($index = 0; isset($queue[$index]); $index++) {
+            [$path, $current, $backReference] = $queue[$index];
+
+            if (isset($visited[spl_object_id($current)])) {
+                continue;
+            }
+
+            $visited[spl_object_id($current)] = true;
+
+            $metadata = $metadataByClass[$current::class] ??= $this->findEntityMetadata($entityManager, $current::class);
+
+            if (! $metadata instanceof ClassMetadata || $entityManager->isUninitializedObject($current)) {
+                continue;
+            }
+
+            yield [$path, $current, $metadata, $backReference];
+
+            foreach ($metadata->associationMappings as $name => $mapping) {
+                if ($cascadePersistOnly && ! $mapping->isCascadePersist()) {
+                    continue;
+                }
+
+                $related = $metadata->getFieldValue($current, $name);
+                $relatedPath = $this->joinPropertyPath($path, $name);
+                $relatedBackReference = $mapping instanceof InverseSideMapping ? $mapping->mappedBy : null;
+
+                if ($mapping->isToOne()) {
+                    if (is_object($related)) {
+                        $queue[] = [$relatedPath, $related, $relatedBackReference];
+                    }
+
+                    continue;
+                }
+
+                if (! is_iterable($related) || ($related instanceof PersistentCollection && ! $related->isInitialized())) {
+                    continue;
+                }
+
+                foreach ($related as $key => $member) {
+                    if (is_object($member) && (is_int($key) || is_string($key))) {
+                        $queue[] = [sprintf('%s[%s]', $relatedPath, $key), $member, $relatedBackReference];
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * @param class-string $class
+     *
+     * @return ClassMetadata<object>|null
+     */
+    private function findEntityMetadata(EntityManagerInterface $entityManager, string $class): ?ClassMetadata
+    {
+        if (new ReflectionClass($class)->isAnonymous() || $entityManager->getMetadataFactory()->isTransient($class)) {
+            return null;
+        }
+
+        return $entityManager->getClassMetadata($class);
+    }
+
+    /**
+     * Whether a new record's assigned key is held already: by a new record
+     * this walk met first — compared as the columns would store it, and an
+     * association by the very object, the only identity a new target has — or
+     * by the record `find()` answers, the identity map first and then one
+     * SELECT. A key still missing a component, or holding a blank one, has
+     * nothing to look up.
+     *
+     * @param ClassMetadata<object> $metadata
+     * @param array<string, true>   $claimed
+     */
+    private function isIdentifierTaken(object $record, ClassMetadata $metadata, array &$claimed): bool
+    {
+        $entityManager = $this->requireEntityManager();
+        $platform = $entityManager->getConnection()->getDatabasePlatform();
+        $parts = [];
+
+        foreach ($metadata->identifier as $field) {
+            $value = $metadata->getFieldValue($record, $field);
+
+            if ($metadata->hasAssociation($field) ? $value === null : blank($value)) {
+                return false;
+            }
+
+            if ($metadata->hasAssociation($field)) {
+                $parts[] = is_object($value) ? 'o' . spl_object_id($value) : 'v' . serialize($value);
+
+                continue;
+            }
+
+            $type = $metadata->getTypeOfField($field);
+            $value = $value instanceof BackedEnum ? $value->value : $value;
+            $parts[] = 'v' . serialize($type === null ? $value : Type::getType($type)->convertToDatabaseValue($value, $platform));
+        }
+
+        $claim = $metadata->rootEntityName . "\0" . implode("\0", $parts);
+
+        if (isset($claimed[$claim])) {
+            return true;
+        }
+
+        $claimed[$claim] = true;
+
+        $values = RecordKey::values($entityManager, $record, $metadata->getName());
+
+        if ($values === null || array_any($values, static fn (mixed $value): bool => blank($value))) {
+            return false;
+        }
+
+        $holder = $this->findWithFiltersSuspended($entityManager, $metadata->rootEntityName, array_combine($metadata->identifier, $values));
+
+        return $holder !== null && $holder !== $record;
+    }
+
+    /**
+     * `find()` past every enabled SQL filter, restoring each filter afterwards,
+     * even when the lookup throws. A holder the filters hid is loaded into the
+     * identity map for the rest of the request, and its load listeners run.
+     *
+     * @param class-string         $class
+     * @param array<string, mixed> $identifier
+     */
+    private function findWithFiltersSuspended(EntityManagerInterface $entityManager, string $class, array $identifier): ?object
+    {
+        if (! $entityManager->hasFilters()) {
+            return $entityManager->find($class, $identifier);
+        }
+
+        $filters = $entityManager->getFilters();
+        $suspended = array_keys($filters->getEnabledFilters());
+
+        foreach ($suspended as $name) {
+            $filters->suspend($name);
+        }
+
+        try {
+            return $entityManager->find($class, $identifier);
+        } finally {
+            foreach ($suspended as $name) {
+                $filters->restore($name);
+            }
+        }
+    }
+
+    /**
+     * @param ClassMetadata<object> $metadata
+     *
+     * @return non-empty-list<string>
+     */
+    private function getTakenIdentifierFields(ClassMetadata $metadata, ?string $backReference): array
+    {
+        $fields = array_values(array_filter($metadata->identifier, static fn (string $field): bool => ! $metadata->hasAssociation($field)));
+
+        if ($fields !== []) {
+            return $fields;
+        }
+
+        return [array_find($metadata->identifier, static fn (string $field): bool => $field !== $backReference) ?? $metadata->identifier[0]];
+    }
+
+    /**
+     * Put back each identifier field of a managed record that no longer prints
+     * the value the unit of work keyed it by — a scalar from that identifier,
+     * an association from the original data — and answer those fields.
+     *
+     * @param ClassMetadata<object> $metadata
+     *
+     * @return list<string>
+     */
+    private function revertIdentifierChange(object $record, ClassMetadata $metadata): array
+    {
+        $entityManager = $this->requireEntityManager();
+        $unitOfWork = $entityManager->getUnitOfWork();
+        $identifier = $unitOfWork->getEntityIdentifier($record);
+        $changed = [];
+
+        foreach ($metadata->identifier as $field) {
+            $stored = $identifier[$field] ?? null;
+            $current = $metadata->getFieldValue($record, $field);
+
+            if ($metadata->hasAssociation($field)) {
+                $current = is_object($current)
+                    ? (RecordKey::values($entityManager, $current, $metadata->getAssociationTargetClass($field))[0] ?? null)
+                    : null;
+            }
+
+            if ($stored === $current) {
+                continue;
+            }
+
+            $printed = IdentifierFields::printable($stored);
+
+            if ($printed !== null && $printed === IdentifierFields::printable($current)) {
+                continue;
+            }
+
+            $changed[] = $field;
+        }
+
+        if ($changed === []) {
+            return [];
+        }
+
+        $original = $unitOfWork->getOriginalEntityData($record);
+
+        foreach ($changed as $field) {
+            $metadata->setFieldValue($record, $field, $metadata->hasAssociation($field)
+                ? ($original[$field] ?? throw new LogicException(sprintf('[%s::$%s] is an identifier association the unit of work holds no original value for, so its change cannot be put back.', $metadata->getName(), $field)))
+                : $identifier[$field]);
+        }
+
+        return $changed;
+    }
+
+    private function joinPropertyPath(string $path, string $property): string
+    {
+        return $path === '' ? $property : $path . '.' . $property;
     }
 
     private function getPropertyAccessor(): PropertyAccessor
@@ -365,17 +800,260 @@ class AssociationReader
         return $list;
     }
 
-    private function getRelatedKeysSubselect(Relationship $relationship, AssociationTarget $target): string
+    /**
+     * The record a key names, or null when the key is malformed for the class —
+     * decoded first, so nothing is looked up — or when it names no row on the
+     * loading route. A reference is built from the identifier values alone,
+     * which an identifier field that is an association cannot be handed, so
+     * those classes load; a scalar identifier keeps the reference's zero
+     * statements.
+     *
+     * @param class-string $class
+     */
+    private function findReference(string $class, string $key): ?object
+    {
+        $entityManager = $this->requireEntityManager();
+        $identifier = RecordKey::toIdentifier($entityManager, $class, $key);
+
+        if ($identifier === null) {
+            return null;
+        }
+
+        $metadata = $entityManager->getClassMetadata($class);
+
+        return array_any($metadata->identifier, $metadata->hasAssociation(...))
+            ? $entityManager->find($class, $identifier)
+            : $entityManager->getReference($class, $identifier);
+    }
+
+    /**
+     * @param ClassMetadata<object> $metadata
+     */
+    private function isSingleScalarIdentifier(ClassMetadata $metadata): bool
+    {
+        return count($metadata->identifier) === 1 && ! $metadata->hasAssociation($metadata->identifier[0]);
+    }
+
+    /**
+     * Whether an identifier association, at any depth, points at a record
+     * whose generated identifier is still unset.
+     */
+    private function awaitsGeneratedIdentifier(object $record): bool
+    {
+        $entityManager = $this->requireEntityManager();
+        $metadata = $entityManager->getClassMetadata($record::class);
+
+        foreach ($metadata->identifier as $field) {
+            $target = $metadata->hasAssociation($field) ? $metadata->getFieldValue($record, $field) : null;
+
+            if (! is_object($target)) {
+                continue;
+            }
+
+            $targetMetadata = $entityManager->getClassMetadata($metadata->getAssociationTargetClass($field));
+
+            if ($targetMetadata->usesIdGenerator() ? $targetMetadata->getIdentifierValues($target) === [] : $this->awaitsGeneratedIdentifier($target)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * The blank assigned identifier fields of a record, prefixed by `$path`:
+     * its blank scalar ones, then each identifier association left unset, or
+     * whose target's own assigned key is blank — the target's blank fields
+     * before the association itself. A target whose identifier is generated is
+     * never blank here.
+     *
+     * @param ClassMetadata<object> $metadata
+     *
+     * @return list<string>
+     */
+    private function findBlankIdentifierPaths(object $record, ClassMetadata $metadata, string $path): array
+    {
+        $scalars = [];
+        $associations = [];
+
+        foreach ($metadata->identifier as $field) {
+            $value = $metadata->getFieldValue($record, $field);
+            $fieldPath = $this->joinPropertyPath($path, $field);
+
+            if (! $metadata->hasAssociation($field)) {
+                if (blank($value)) {
+                    $scalars[] = $fieldPath;
+                }
+
+                continue;
+            }
+
+            if (! is_object($value)) {
+                $associations[] = $fieldPath;
+
+                continue;
+            }
+
+            $targetMetadata = $this->requireEntityManager()->getClassMetadata($value::class);
+
+            if ($targetMetadata->usesIdGenerator()) {
+                continue;
+            }
+
+            $targetPaths = $this->findBlankIdentifierPaths($value, $targetMetadata, $fieldPath);
+
+            if ($targetPaths !== []) {
+                $associations = [...$associations, ...$targetPaths, $fieldPath];
+            }
+        }
+
+        return [...$scalars, ...$associations];
+    }
+
+    /**
+     * {@see hasIncompleteAssignedIdentifier()} without its entry bound, so that
+     * behind an identifier association a single assigned scalar still counts. A
+     * generated identifier that is still pending is Doctrine's to fill at flush,
+     * and so is one the class assigns from a prePersist callback or a mapped
+     * entity listener; none of the three is missing.
+     */
+    private function isMissingAssignedIdentifierComponent(object $entity): bool
+    {
+        $metadata = $this->requireEntityManager()->getClassMetadata($entity::class);
+
+        if ($metadata->usesIdGenerator() || $metadata->hasLifecycleCallbacks(Events::prePersist) || isset($metadata->entityListeners[Events::prePersist])) {
+            return false;
+        }
+
+        foreach ($metadata->identifier as $field) {
+            $value = $metadata->getFieldValue($entity, $field);
+
+            if ($metadata->hasAssociation($field)) {
+                if (! is_object($value) || $this->isMissingAssignedIdentifierComponent($value)) {
+                    return true;
+                }
+
+                continue;
+            }
+
+            if (blank($value)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * The owner's own association, correlated back to the outer target row: a
+     * subselect over the owner rather than a join, so the outer query keeps its
+     * single root, and an identifier-wide correlation rather than a key list,
+     * since comparing two identification variables compares their first
+     * identifier column alone.
+     */
+    private function getRelatedRecordsExists(QueryBuilder $query, Relationship $relationship, AssociationTarget $target, string $alias): string
     {
         $ownerClass = $this->getEntityClass($relationship->owner);
 
         return sprintf(
-            'SELECT sy_related.%s FROM %s sy_owner JOIN sy_owner.%s sy_related WHERE sy_owner.%s = :sylament_relationship_owner',
-            $this->getIdentifierFieldName($target->targetClass),
+            'EXISTS (SELECT 1 FROM %s sy_owner JOIN sy_owner.%s sy_related WHERE %s AND %s)',
             $ownerClass,
             $relationship->name,
-            $this->getIdentifierFieldName($ownerClass),
+            $this->getOwnerScope($query, $relationship, $ownerClass),
+            IdentifierConstraint::correlate($query, 'sy_related', $target->targetClass, $alias),
         );
+    }
+
+    /**
+     * Whether the narrowing is the correlated subselect rather than the target's
+     * own mapped-by field: always for a many-to-many, and for a one-to-many whose
+     * owner is keyed by several fields.
+     */
+    private function isScopedThroughOwner(Relationship $relationship, AssociationTarget $target): bool
+    {
+        return $target->isManyToMany || $this->hasCompositeOwner($relationship);
+    }
+
+    private function hasCompositeOwner(Relationship $relationship): bool
+    {
+        return $this->requireEntityManager()->getClassMetadata($this->getEntityClass($relationship->owner))->isIdentifierComposite;
+    }
+
+    /**
+     * The subselect's owner narrowed to this one. An owner keyed by several
+     * fields binds itself here, one typed parameter per field, through the key it
+     * mints; a single-identifier owner is bound by {@see bindRelationshipOwner()}.
+     *
+     * @param class-string $ownerClass
+     *
+     * @throws LogicException when the owner's own key does not decode, since a dropped scope would list every owner's records
+     */
+    private function getOwnerScope(QueryBuilder $query, Relationship $relationship, string $ownerClass): string
+    {
+        if (! $this->hasCompositeOwner($relationship)) {
+            return sprintf('sy_owner.%s = :sylament_relationship_owner', $this->getOwnerIdentifierField($ownerClass));
+        }
+
+        $key = $this->getRecordKey($relationship->owner);
+
+        return IdentifierConstraint::equals($query, 'sy_owner', $ownerClass, $key, 'sylament_relationship_owner')
+            ?? throw new LogicException(sprintf('The owner [%s] mints the key [%s], which does not decode against its own mapping, so the relationship [%s] cannot be scoped to it — an identifier type that cannot read its own printed form.', $ownerClass, $key, $relationship->name));
+    }
+
+    /**
+     * @param class-string $ownerClass
+     */
+    private function getOwnerIdentifierField(string $ownerClass): string
+    {
+        return $this->requireEntityManager()->getClassMetadata($ownerClass)->identifier[0];
+    }
+
+    /**
+     * @param class-string $class
+     */
+    private function isIdentifierField(string $class, string $field): bool
+    {
+        return in_array($field, $this->requireEntityManager()->getClassMetadata($class)->identifier, true);
+    }
+
+    /**
+     * Refuse the one write the relation layer never makes: an existing record
+     * whose mapped-by field is part of its identifier, already pointing at
+     * another owner. A record the entity manager does not manage yet has no
+     * primary key to move — it is written under this owner, which is what a
+     * create form building its child does — and so is one pointing at nobody or
+     * at this owner.
+     *
+     * @throws LogicException when the write would move the target's primary key
+     */
+    private function assertAttachKeepsIdentifier(Relationship $relationship, AssociationTarget $target, object $related): void
+    {
+        $mappedBy = $this->getMappedBy($relationship, $target);
+
+        if (! $this->isIdentifierField($target->targetClass, $mappedBy) || ! $this->requireEntityManager()->contains($related)) {
+            return;
+        }
+
+        $current = $this->requireEntityManager()->getClassMetadata($target->targetClass)->getFieldValue($related, $mappedBy);
+
+        if (is_object($current) && $current !== $relationship->owner) {
+            throw $this->refuseRekeyingAssociate($relationship, $target->targetClass, $mappedBy);
+        }
+    }
+
+    /**
+     * @param class-string $targetClass
+     */
+    private function refuseRekeyingAssociate(Relationship $relationship, string $targetClass, string $mappedBy): LogicException
+    {
+        return new LogicException(sprintf(
+            '[%s::$%s] is part of the identifier of [%s], so an existing record cannot be associated into [%s::$%s] — pointing it at another owner would move its primary key. Create the record under this owner instead, or move the association out of the identifier.',
+            $targetClass,
+            $mappedBy,
+            $targetClass,
+            $this->getEntityClass($relationship->owner),
+            $relationship->name,
+        ));
     }
 
     /**
@@ -387,15 +1065,28 @@ class AssociationReader
     }
 
     /**
-     * The owner itself as the bound parameter — Doctrine binds a managed entity
-     * by its identifier, typed as the column is — after refusing an owner that
-     * has none yet.
+     * The single-identifier owner's parameter, after refusing an owner that has
+     * no identifier yet: its identifier value — one that is an association
+     * reduced to its target's, at any depth — bound under that terminal field's
+     * DBAL type, because Doctrine binds an entity by casting its identifier and
+     * never converts it. An owner keyed by several fields bound itself while its
+     * scope was composed.
      */
-    private function getRelationshipOwner(Relationship $relationship): object
+    private function bindRelationshipOwner(QueryBuilder $query, Relationship $relationship): QueryBuilder
     {
+        if ($this->hasCompositeOwner($relationship)) {
+            return $query;
+        }
+
+        $entityManager = $this->requireEntityManager();
+        $ownerClass = $this->getEntityClass($relationship->owner);
+
         $this->getRecordKey($relationship->owner);
 
-        return $relationship->owner;
+        $values = RecordKey::values($entityManager, $relationship->owner, $ownerClass)
+            ?? throw new LogicException(sprintf('Object records must expose a readable non-blank identifier; [%s] has none set.', $relationship->owner::class));
+
+        return $query->setParameter('sylament_relationship_owner', $values[0], IdentifierFields::of($entityManager, $ownerClass)->types[0]);
     }
 
     /**

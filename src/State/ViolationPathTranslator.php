@@ -6,6 +6,7 @@ namespace Sylament\Schemas\State;
 
 use Sylament\Schemas\Components\Component;
 use Sylament\Schemas\Components\Contracts\HasKeyedItems;
+use Sylament\Schemas\Components\Contracts\HasValidationConstraints;
 use Symfony\Component\PropertyAccess\Exception\InvalidPropertyPathException;
 use Symfony\Component\PropertyAccess\PropertyPath;
 
@@ -39,6 +40,87 @@ final readonly class ViolationPathTranslator
      */
     public function translate(string $violationPropertyPath): ?string
     {
+        $match = $this->matchRecordPath($violationPropertyPath);
+
+        return $match === null ? null : $this->resolveStatePath(...$match)[0];
+    }
+
+    /**
+     * The absolute state path a violation's message is shown under:
+     * translate()'s answer when the component owning it shows its own errors —
+     * a field declaring validation constraints, or a component keying items —
+     * and null when it shows none, as a layout component entangling a related
+     * record does, or when the answer is a keyed item's own path, which no
+     * template reads; the caller folds the message at the schema's own path.
+     */
+    public function translateToErrorPath(string $violationPropertyPath): ?string
+    {
+        $match = $this->matchRecordPath($violationPropertyPath);
+
+        if ($match === null) {
+            return null;
+        }
+
+        $component = $this->recordPathMap[$match[2]];
+
+        if (! $component instanceof HasValidationConstraints && ! $component instanceof HasKeyedItems) {
+            return null;
+        }
+
+        [$statePath, $isItemPath] = $this->resolveStatePath(...$match);
+
+        return $isItemPath ? null : $statePath;
+    }
+
+    /**
+     * The absolute state path a matched violation lands on, and whether that is
+     * a keyed item's own path — an item the index named, whose remainder no
+     * path the item declares takes.
+     *
+     * @return array{string, bool}
+     */
+    private function resolveStatePath(PropertyPath $propertyPath, int $matchedDepth, string $recordPath): array
+    {
+        $statePath = filled($this->rootStatePath) ? $this->rootStatePath . '.' . $recordPath : $recordPath;
+
+        $component = $this->recordPathMap[$recordPath];
+
+        if (! $component instanceof HasKeyedItems) {
+            return [$statePath, false];
+        }
+
+        $itemKey = $this->resolveItemKey($component, $propertyPath, $matchedDepth);
+
+        if ($itemKey === null) {
+            return [$statePath, false];
+        }
+
+        $statePath .= '.' . $itemKey;
+
+        $remainder = $this->readItemRemainder($propertyPath, $matchedDepth);
+
+        if ($remainder === []) {
+            return [$statePath, true];
+        }
+
+        $declaredDepth = $this->matchItemDepth($remainder, $component->getItemStatePaths());
+
+        if ($declaredDepth === null) {
+            return [$statePath, true];
+        }
+
+        return [$statePath . '.' . implode('.', array_slice($remainder, 0, $declaredDepth)), false];
+    }
+
+    /**
+     * The parsed violation path, how many of its leading elements the deepest
+     * declared record path covers, and that record path — or null when the
+     * path does not parse or no declared path covers it.
+     *
+     * @return array{PropertyPath, int, string}|null
+     */
+    private function matchRecordPath(string $violationPropertyPath): ?array
+    {
         try {
             $propertyPath = new PropertyPath($violationPropertyPath);
         } catch (InvalidPropertyPathException) {
@@ -48,43 +130,13 @@ final readonly class ViolationPathTranslator
             return null;
         }
 
-        $elements = $propertyPath->getElements();
         $matchedDepth = $this->matchDepth($propertyPath);
 
         if ($matchedDepth === null) {
             return null;
         }
 
-        $recordPath = implode('.', array_slice($elements, 0, $matchedDepth));
-        $statePath = filled($this->rootStatePath) ? $this->rootStatePath . '.' . $recordPath : $recordPath;
-
-        $component = $this->recordPathMap[$recordPath];
-
-        if (! $component instanceof HasKeyedItems) {
-            return $statePath;
-        }
-
-        $itemKey = $this->resolveItemKey($component, $propertyPath, $matchedDepth);
-
-        if ($itemKey === null) {
-            return $statePath;
-        }
-
-        $statePath .= '.' . $itemKey;
-
-        $remainder = $this->readItemRemainder($propertyPath, $matchedDepth);
-
-        if ($remainder === []) {
-            return $statePath;
-        }
-
-        $declaredDepth = $this->matchItemDepth($remainder, $component->getItemStatePaths());
-
-        if ($declaredDepth === null) {
-            return $statePath;
-        }
-
-        return $statePath . '.' . implode('.', array_slice($remainder, 0, $declaredDepth));
+        return [$propertyPath, $matchedDepth, implode('.', array_slice($propertyPath->getElements(), 0, $matchedDepth))];
     }
 
     /**

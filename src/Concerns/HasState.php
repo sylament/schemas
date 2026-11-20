@@ -113,6 +113,8 @@ trait HasState
      */
     public function fill(object|array|null $state = null): static
     {
+        $isRecordFill = is_object($state) || is_object($this->getRecord());
+
         if (is_object($state)) {
             $state = $this->readStateFromRecord($state);
         }
@@ -127,6 +129,10 @@ trait HasState
         $this->callAfterStateHydrated();
         $this->fillStateWithNull();
 
+        if ($isRecordFill) {
+            $this->refuseUnmappedRelationshipHooksAfterFill();
+        }
+
         return $this;
     }
 
@@ -135,8 +141,25 @@ trait HasState
         $appliedStateCastPaths = [];
         $hydratedDefaultState = [];
 
-        foreach ($this->getFlatComponents(withActions: false) as $component) {
+        $this->hydrateComponentsState($applyDefaults, $appliedStateCastPaths, $hydratedDefaultState);
+    }
+
+    /**
+     * Each component is hydrated before its child schemas are read, so a container
+     * whose child schemas derive from its state (a repeater's items) is descended
+     * into through the schemas the state it has just written produces.
+     *
+     * @param array<string, true> $appliedStateCastPaths
+     * @param array<string, mixed> $hydratedDefaultState
+     */
+    private function hydrateComponentsState(bool $applyDefaults, array &$appliedStateCastPaths, array &$hydratedDefaultState): void
+    {
+        foreach ($this->getComponents(withActions: false) as $component) {
             $component->hydrateState($applyDefaults, $appliedStateCastPaths, $hydratedDefaultState);
+
+            foreach ($component->getChildSchemas() as $childSchema) {
+                $childSchema->hydrateComponentsState($applyDefaults, $appliedStateCastPaths, $hydratedDefaultState);
+            }
         }
     }
 

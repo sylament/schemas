@@ -101,9 +101,11 @@ trait BelongsToRecord
         }
 
         if (is_string($this->record)) {
-            $recordClass = $this->record;
-
-            return new $recordClass();
+            return $this->getPropertyAccessor()->constructRecord(
+                $this->record,
+                'a new record onto the schema',
+                'hand the schema a record built with its arguments, through record().',
+            );
         }
 
         return null;
@@ -127,6 +129,18 @@ trait BelongsToRecord
      *                        ({@see Component::routesNestedRelationshipHookAt()})
      */
     protected function getRecordPathMap(): array
+    {
+        return $this->collectRecordPaths()[0];
+    }
+
+    /**
+     * {@see getRecordPathMap()}, beside the paths it dropped beneath a subtree
+     * owner — which a violation raised inside that owner's related record is
+     * still spoken in.
+     *
+     * @return array{array<string, Component>, array<string, Component>}
+     */
+    private function collectRecordPaths(): array
     {
         $map = [];
         $owners = [];
@@ -214,7 +228,22 @@ trait BelongsToRecord
             $this->refuseUnmappedRelationshipHook($component);
         }
 
-        return $map;
+        return [$map, $dropped];
+    }
+
+    /**
+     * Walk the map again over the tree a fill has just hydrated, when the fill was
+     * handed a record or the schema is bound to one — the state a host read off
+     * that record included: the read walked the map before a container that
+     * builds its children from its state (a repeater's items) held any, so only
+     * this walk sees a hook declared inside one, and refuses it on the first
+     * render rather than first on submit.
+     *
+     * @throws LogicException as {@see getRecordPathMap()} does
+     */
+    private function refuseUnmappedRelationshipHooksAfterFill(): void
+    {
+        $this->collectRecordPaths();
     }
 
     /**
@@ -430,7 +459,7 @@ trait BelongsToRecord
      * Read this schema's declared leaf paths off a record, traversing its
      * object graph. Unreadable and uninitialized properties are skipped, as
      * are object-valued leaves other than one the component's state casts
-     * flatten to a non-object ({@see self::isObjectCarriedByStateCasts()}) —
+     * flatten to a non-object ({@see Component::isObjectCarriedByStateCasts()}) —
      * the null-fill pass supplies the skipped keys; a
      * null or scalar intermediate supplies null. A component declaring
      * {@see Component::loadStateFromRelationshipsUsing()} supplies its own
@@ -458,7 +487,7 @@ trait BelongsToRecord
                 continue;
             }
 
-            if (is_object($value) && ! $this->isObjectCarriedByStateCasts($component, $value)) {
+            if (is_object($value) && ! $component->isObjectCarriedByStateCasts($value)) {
                 continue;
             }
 
@@ -466,6 +495,40 @@ trait BelongsToRecord
         }
 
         return $state;
+    }
+
+    /**
+     * Read every relationship-backed component's state back off the bound
+     * record, as a fill reads those paths — for the host to call once its flush
+     * has run, so an item or a related record the save created is keyed by the
+     * identifier the flush gave it and the next save updates that record rather
+     * than building it again. A schema bound to no record reads nothing.
+     */
+    public function loadStateFromRelationships(): void
+    {
+        $record = $this->getRecord();
+
+        if (! is_object($record)) {
+            return;
+        }
+
+        foreach ($this->getRecordPathMap() as $component) {
+            if (! $component->hasLoadStateFromRelationships()) {
+                continue;
+            }
+
+            $component->rawState($component->loadStateFromRelationships($record));
+            $component->hydrateState(applyDefaults: false);
+
+            foreach ($component->getChildSchemas() as $childSchema) {
+                $childSchema->hydrateState(applyDefaults: false);
+                $childSchema->callAfterStateHydrated();
+                $childSchema->fillStateWithNull();
+            }
+
+            $component->callAfterStateHydrated();
+            $component->fillStateWithNull();
+        }
     }
 
     /**
@@ -482,36 +545,14 @@ trait BelongsToRecord
     }
 
     /**
-     * Whether this object leaf is one the component's own state casts flatten
-     * into a non-object. The state bag is a writable `array` LiveProp and the
-     * hydrator refuses an object anywhere inside one, so the exemption from the
-     * object-value skip is exactly as wide as the cast that earns it: the chain
-     * is run here to ask, and the hydration pass behind the read runs it again
-     * to convert. A component with no cast, or one whose casts leave the value
-     * an object, is skipped and null-filled as any other object leaf is.
-     */
-    private function isObjectCarriedByStateCasts(Component $component, object $value): bool
-    {
-        $stateCasts = $component->getStateCasts();
-
-        if ($stateCasts === []) {
-            return false;
-        }
-
-        foreach ($stateCasts as $stateCast) {
-            $value = $stateCast->set($value);
-        }
-
-        return ! is_object($value);
-    }
-
-    /**
      * The inverse of the mapping walk, handed to the host so a violation raised
      * against the mapped record can be spoken back in this schema's state paths.
      */
     public function getRecordViolationPathTranslator(): ViolationPathTranslator
     {
-        return new ViolationPathTranslator($this->getRecordPathMap(), $this->getStatePath());
+        [$map, $dropped] = $this->collectRecordPaths();
+
+        return new ViolationPathTranslator([...$dropped, ...$map], $this->getStatePath());
     }
 
     /**
@@ -669,5 +710,60 @@ trait BelongsToRecord
         $this->getLiveComponentOrNull()?->validateSchemaRecord($this, $record);
 
         return $record;
+    }
+
+    /**
+     * The leaf paths `$after` adds to `$before` that no component of this
+     * schema maps onto the record, in `$after`'s order — a path `$before` does
+     * not hold, or one where `$before` held an array and `$after` holds
+     * something else. A path a component maps, or one beneath it, is covered.
+     *
+     * @internal the default write seams, which refuse what it answers
+     *
+     * @param array<string, mixed> $before
+     * @param array<string, mixed> $after
+     *
+     * @return list<string>
+     */
+    public function findUnmappedAdditions(array $before, array $after): array
+    {
+        $recordPaths = array_map(strval(...), array_keys($this->getRecordPathMap()));
+
+        return array_values(array_filter(
+            $this->findAddedPaths($before, $after, ''),
+            static fn (string $path): bool => ! array_any($recordPaths, static fn (string $recordPath): bool => $path === $recordPath || str_starts_with($path, $recordPath . '.')),
+        ));
+    }
+
+    /**
+     * @param array<array-key, mixed> $after
+     *
+     * @return list<string>
+     */
+    private function findAddedPaths(mixed $before, array $after, string $prefix): array
+    {
+        $paths = [];
+
+        foreach ($after as $key => $value) {
+            $path = $prefix === '' ? (string) $key : $prefix . '.' . $key;
+            $isHeld = is_array($before) && array_key_exists($key, $before);
+            $held = is_array($before) ? ($before[$key] ?? null) : null;
+
+            if ($isHeld && $held === $value) {
+                continue;
+            }
+
+            if (is_array($value) && $value !== []) {
+                $paths = [...$paths, ...$this->findAddedPaths($held, $value, $path)];
+
+                continue;
+            }
+
+            if (! $isHeld || (is_array($held) && ! is_array($value))) {
+                $paths[] = $path;
+            }
+        }
+
+        return $paths;
     }
 }
